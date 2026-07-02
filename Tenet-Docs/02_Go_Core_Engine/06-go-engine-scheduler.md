@@ -23,7 +23,7 @@ type Scheduler struct {
     mu            sync.RWMutex
 
     maxConcurrent int                    // 来自 config.Workflow.MaxConcurrentTasks
-    queueSize     int                    // 来自 database.write_queue_size
+    queueSize     int                    // 来自 scheduler.queue_size（独立配置）
 
     store         EventStore             // 用于 TimerService 写 TimerFired 事件
     config        *RuntimeConfig

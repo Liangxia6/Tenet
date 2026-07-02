@@ -34,7 +34,15 @@
 | `database.write_queue_size` | Integer | `1000` | Static-Immutable | WriteDaemon 缓冲 channel 大小 |
 | `database.wal_mode` | Boolean | `true` | Static-Immutable | 启用 WAL 模式 |
 
-### 2.2 redis
+### 2.2 scheduler
+
+| 参数路径 | 类型 | 默认值 | 类别 |
+|---|---|---|---|
+| `scheduler.queue_size` | Integer | `100` | Static-HotReload |
+
+`scheduler.queue_size` 控制调度器 `workflowQueue` 的容量。调度队列与 SQLite 写入队列物理解耦：数据库的 `database.write_queue_size` 仅影响 WriteDaemon，调度器缓存高峰任务时不再受数据库配置牵连。
+
+### 2.3 redis
 
 | 参数路径 | 类型 | 默认值 | 类别 |
 |---|---|---|---|

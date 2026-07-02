@@ -31,11 +31,11 @@ Task 提交后 → Strategy Router → 调 Python LLM 做复杂度分析 → 选
 | 条件 | Workflow | 说明 |
 |---|---|---|
 | 用户显式指定 `--workflow` | 直接使用用户指定的类型 | 覆盖自动路由 |
+| 任务涉及代码编写/修改 | `CodingWorkflow` | 优先级最高：关键词命中直接路由，忽略复杂度得分 |
+| 任务需要人工审批 | `InteractiveWorkflow` | 次高优先级：策略判定在编码场景之外触发 |
 | `complexity_score < 0.3` | `SimpleWorkflow` | 单 Agent 直接回答 |
 | `0.3 <= complexity_score < 0.7` | `DAGWorkflow` | 分解为子任务并行执行。DAG 的每个子任务内部使用 ReactWorkflow（Go 侧 for 循环） |
 | `complexity_score >= 0.7` | `ScientificWorkflow` | 高复杂度需要 CoT→Debate→ToT→Reflection 推理链 |
-| 任务涉及代码编写/修改 | `CodingWorkflow` | 自动检测关键词（"写代码"/"修 bug"/"实现"/"implement"） |
-| 任务需要人工审批 | `InteractiveWorkflow` | 当工具调用命中 `Safety.RequireApproval` 列表时触发 |
 
 **内部委托模型**：
 - `DAGWorkflow` 的子任务内部使用 `ReactWorkflow`——React 不是顶层路由目标，而是 DAG 的执行单元。
