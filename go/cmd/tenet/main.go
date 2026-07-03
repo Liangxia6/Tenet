@@ -5,15 +5,26 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"github.com/tenet/orchestrator/internal/config"
+	"github.com/tenet/orchestrator/internal/eventrouter"
+	"github.com/tenet/orchestrator/internal/gateway"
+	"github.com/tenet/orchestrator/internal/guard"
+	"github.com/tenet/orchestrator/internal/projection"
+	"github.com/tenet/orchestrator/internal/scheduler"
 	"github.com/tenet/orchestrator/internal/storage"
+	timerpkg "github.com/tenet/orchestrator/internal/timer"
 	"github.com/tenet/orchestrator/internal/worker"
 	"github.com/tenet/orchestrator/internal/workflow"
+	workspacepkg "github.com/tenet/orchestrator/internal/workspace"
 )
 
 const version = "0.1.0"
@@ -40,6 +51,8 @@ func run(args []string) error {
 		return configCmd(args[1:])
 	case "task":
 		return taskCmd(args[1:])
+	case "workspace":
+		return workspaceCmd(args[1:])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -50,6 +63,7 @@ func serve(args []string) error {
 	configPath := fs.String("config", "config/tenet.yaml", "path to configuration file")
 	port := fs.Int("port", 0, "orchestrator port")
 	workerPort := fs.Int("worker-port", 0, "worker port")
+	httpPort := fs.Int("http-port", 0, "HTTP API port; disabled when 0")
 	dbPath := fs.String("db", "", "sqlite database path")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -75,8 +89,108 @@ func serve(args []string) error {
 		return err
 	}
 	defer store.Close()
-	fmt.Printf("tenet ready: orchestrator=:%d worker=:%d database=%s\n", cfg.GRPC.OrchestratorPort, cfg.GRPC.WorkerPort, cfg.Database.Path)
-	return nil
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPC.OrchestratorPort))
+	if err != nil {
+		return err
+	}
+	server := gateway.NewOrchestratorServer("tenet-"+newID(), gateway.NewWorkerRegistry())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.Serve(listener)
+	}()
+	var httpServer *http.Server
+	if *httpPort > 0 {
+		httpServer = newHTTPServer(fmt.Sprintf(":%d", *httpPort), store, cfg)
+		go func() {
+			if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				errCh <- err
+			}
+		}()
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	fmt.Printf("tenet ready: orchestrator=%s worker=:%d http=:%d database=%s\n", listener.Addr().String(), cfg.GRPC.WorkerPort, *httpPort, cfg.Database.Path)
+	select {
+	case <-ctx.Done():
+		server.Stop()
+		if httpServer != nil {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = httpServer.Shutdown(shutdownCtx)
+		}
+		return nil
+	case err := <-errCh:
+		return err
+	}
+}
+
+func newHTTPServer(addr string, store storage.Store, cfg *config.RuntimeConfig) *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "version": version})
+	})
+	mux.HandleFunc("/tasks", func(w http.ResponseWriter, r *http.Request) {
+		limit := 20
+		streams, err := store.ListStreams(limit)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		engine := projection.NewEngine(store, cfg)
+		items := make([]map[string]any, 0, len(streams))
+		for _, stream := range streams {
+			view, _ := engine.ProjectTask(stream.StreamID)
+			items = append(items, map[string]any{
+				"stream_id":  stream.StreamID,
+				"status":     view.Status,
+				"latest_seq": stream.LatestSeq,
+				"last_event": stream.EventType,
+				"query":      view.Query,
+			})
+		}
+		_ = json.NewEncoder(w).Encode(items)
+	})
+	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
+		streamID := r.URL.Query().Get("stream_id")
+		if streamID == "" {
+			http.Error(w, "stream_id is required", http.StatusBadRequest)
+			return
+		}
+		fromSeq := int64(1)
+		if raw := r.URL.Query().Get("from"); raw != "" {
+			_, _ = fmt.Sscanf(raw, "%d", &fromSeq)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		flusher, _ := w.(http.Flusher)
+		nextSeq := fromSeq
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			events, err := store.Read(streamID, nextSeq)
+			if err != nil {
+				fmt.Fprintf(w, "event: error\ndata: %q\n\n", err.Error())
+				if flusher != nil {
+					flusher.Flush()
+				}
+				return
+			}
+			for _, evt := range events {
+				data, _ := json.Marshal(eventrouter.FromStorageEvent(evt))
+				fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evt.EventType, data)
+				nextSeq = evt.StreamSeq + 1
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	})
+	return &http.Server{Addr: addr, Handler: mux}
 }
 
 func configCmd(args []string) error {
@@ -129,20 +243,262 @@ func configCmd(args []string) error {
 	}
 }
 
+func workspaceCmd(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("missing workspace subcommand")
+	}
+	switch args[0] {
+	case "init":
+		return workspaceInit(args[1:])
+	case "ratio":
+		return workspaceRatio(args[1:])
+	case "snapshot":
+		return workspaceSnapshot(args[1:])
+	case "restore":
+		return workspaceRestore(args[1:])
+	case "cleanup":
+		return workspaceCleanup(args[1:])
+	default:
+		return fmt.Errorf("unknown workspace subcommand %q", args[0])
+	}
+}
+
+func workspaceInit(args []string) error {
+	fs := flag.NewFlagSet("workspace init", flag.ContinueOnError)
+	configPath := fs.String("config", "config/tenet.yaml", "path to configuration file")
+	sessionID := fs.String("session", "", "session id")
+	output := fs.String("output", "text", "output format: text/json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *sessionID == "" {
+		return fmt.Errorf("--session is required")
+	}
+	cfg, err := loadConfig(*configPath, true)
+	if err != nil {
+		return err
+	}
+	path, err := workspacepkg.NewManager(cfg).Init(*sessionID)
+	if err != nil {
+		return err
+	}
+	if *output == "json" {
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{"session_id": *sessionID, "workspace": path})
+	}
+	fmt.Printf("workspace: %s\n", path)
+	return nil
+}
+
+func workspaceRatio(args []string) error {
+	fs := flag.NewFlagSet("workspace ratio", flag.ContinueOnError)
+	configPath := fs.String("config", "config/tenet.yaml", "path to configuration file")
+	path := fs.String("path", "", "workspace path")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *path == "" {
+		return fmt.Errorf("--path is required")
+	}
+	cfg, err := loadConfig(*configPath, true)
+	if err != nil {
+		return err
+	}
+	ratio, err := workspacepkg.NewManager(cfg).AnalyzeTextRatio(*path)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%.4f\n", ratio)
+	return nil
+}
+
+func workspaceSnapshot(args []string) error {
+	fs := flag.NewFlagSet("workspace snapshot", flag.ContinueOnError)
+	configPath := fs.String("config", "config/tenet.yaml", "path to configuration file")
+	path := fs.String("path", "", "workspace path")
+	sessionID := fs.String("session", "", "session id")
+	seq := fs.Int64("seq", 1, "snapshot sequence")
+	streamID := fs.String("stream", "", "optional task stream id to record the snapshot")
+	output := fs.String("output", "text", "output format: text/json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *path == "" {
+		return fmt.Errorf("--path is required")
+	}
+	if *sessionID == "" {
+		return fmt.Errorf("--session is required")
+	}
+	cfg, err := loadConfig(*configPath, true)
+	if err != nil {
+		return err
+	}
+	manager := workspacepkg.NewManager(cfg)
+	if *streamID != "" {
+		store, err := storage.Open(cfg.Database.Path, storage.SQLiteOptions{QueueSize: cfg.Database.WriteQueueSize})
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		result, err := manager.CaptureSnapshot(
+			context.Background(),
+			store,
+			*streamID,
+			*path,
+			*sessionID,
+			*seq,
+			map[string]any{"session_id": *sessionID},
+			nil,
+			zeroFencingLease(),
+		)
+		if err != nil {
+			return err
+		}
+		if *output == "json" {
+			return json.NewEncoder(os.Stdout).Encode(result)
+		}
+		fmt.Printf("%s: %s\n", result.Snapshot.Type, result.Snapshot.Ref)
+		fmt.Printf("stream: %s\n", result.Snapshot.StreamID)
+		fmt.Printf("seq:    %d\n", result.Snapshot.StreamSeq)
+		return nil
+	}
+	snapshot, err := manager.Snapshot(context.Background(), *path, *sessionID, *seq, nil, zeroFencingLease())
+	if err != nil {
+		return err
+	}
+	if *output == "json" {
+		return json.NewEncoder(os.Stdout).Encode(snapshot)
+	}
+	fmt.Printf("%s: %s\n", snapshot.Type, snapshot.Ref)
+	return nil
+}
+
+func workspaceRestore(args []string) error {
+	fs := flag.NewFlagSet("workspace restore", flag.ContinueOnError)
+	configPath := fs.String("config", "config/tenet.yaml", "path to configuration file")
+	archivePath := fs.String("archive", "", "archive snapshot path")
+	destPath := fs.String("dest", "", "destination workspace path")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *archivePath == "" {
+		return fmt.Errorf("--archive is required")
+	}
+	if *destPath == "" {
+		return fmt.Errorf("--dest is required")
+	}
+	cfg, err := loadConfig(*configPath, true)
+	if err != nil {
+		return err
+	}
+	if err := workspacepkg.NewManager(cfg).Restore(context.Background(), workspacepkg.Snapshot{Type: "archive", Ref: *archivePath}, *destPath, nil, zeroFencingLease()); err != nil {
+		return err
+	}
+	fmt.Printf("restored: %s\n", *destPath)
+	return nil
+}
+
+func workspaceCleanup(args []string) error {
+	fs := flag.NewFlagSet("workspace cleanup", flag.ContinueOnError)
+	configPath := fs.String("config", "config/tenet.yaml", "path to configuration file")
+	path := fs.String("path", "", "workspace path")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *path == "" {
+		return fmt.Errorf("--path is required")
+	}
+	cfg, err := loadConfig(*configPath, true)
+	if err != nil {
+		return err
+	}
+	if err := workspacepkg.NewManager(cfg).Cleanup(context.Background(), *path, nil, zeroFencingLease()); err != nil {
+		return err
+	}
+	fmt.Printf("cleaned: %s\n", *path)
+	return nil
+}
+
 func taskCmd(args []string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("missing task subcommand")
 	}
 	switch args[0] {
+	case "list":
+		return taskList(args[1:])
 	case "run":
 		return taskRun(args[1:])
 	case "replay":
 		return taskReplay(args[1:])
 	case "inspect":
 		return taskInspect(args[1:])
+	case "watch":
+		return taskWatch(args[1:])
+	case "status":
+		return taskStatus(args[1:])
+	case "fork":
+		return taskFork(args[1:])
+	case "lineage":
+		return taskLineage(args[1:])
+	case "logs":
+		return taskLogs(args[1:])
+	case "cancel":
+		return taskCancel(args[1:])
+	case "resume":
+		return taskResume(args[1:])
 	default:
 		return fmt.Errorf("unknown task subcommand %q", args[0])
 	}
+}
+
+func taskList(args []string) error {
+	fs := flag.NewFlagSet("task list", flag.ContinueOnError)
+	configPath := fs.String("config", "config/tenet.yaml", "path to configuration file")
+	limit := fs.Int("limit", 20, "maximum number of streams")
+	output := fs.String("output", "text", "output format: text/json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := loadConfig(*configPath, true)
+	if err != nil {
+		return err
+	}
+	store, err := storage.Open(cfg.Database.Path, storage.SQLiteOptions{QueueSize: cfg.Database.WriteQueueSize})
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	streams, err := store.ListStreams(*limit)
+	if err != nil {
+		return err
+	}
+	engine := projection.NewEngine(store, cfg)
+	type taskListItem struct {
+		StreamID  string `json:"stream_id"`
+		Status    string `json:"status"`
+		Workflow  string `json:"workflow,omitempty"`
+		LatestSeq int64  `json:"latest_seq"`
+		LastEvent string `json:"last_event"`
+		Query     string `json:"query,omitempty"`
+	}
+	items := make([]taskListItem, 0, len(streams))
+	for _, stream := range streams {
+		view, _ := engine.ProjectTask(stream.StreamID)
+		items = append(items, taskListItem{
+			StreamID:  stream.StreamID,
+			Status:    string(view.Status),
+			Workflow:  view.WorkflowType,
+			LatestSeq: stream.LatestSeq,
+			LastEvent: stream.EventType,
+			Query:     view.Query,
+		})
+	}
+	if *output == "json" {
+		return json.NewEncoder(os.Stdout).Encode(items)
+	}
+	for _, item := range items {
+		fmt.Printf("%s\t%s\tseq=%d\t%s\t%s\n", item.StreamID, item.Status, item.LatestSeq, item.LastEvent, item.Query)
+	}
+	return nil
 }
 
 func taskRun(args []string) error {
@@ -150,11 +506,13 @@ func taskRun(args []string) error {
 	configPath := fs.String("config", "config/tenet.yaml", "path to configuration file")
 	workspacePath := fs.String("workspace", ".", "workspace path")
 	workflowName := fs.String("workflow", "auto", "workflow type")
-	workerMode := fs.String("worker", "echo", "worker mode: echo/openai")
+	workerMode := fs.String("worker", "echo", "worker mode: echo/openai/deepseek/grpc")
+	workerAddress := fs.String("worker-address", "", "Python worker gRPC address, defaults to grpc.worker_port")
 	model := fs.String("model", "", "model override")
 	baseURL := fs.String("base-url", "", "OpenAI-compatible base URL")
-	apiKeyEnv := fs.String("api-key-env", "OPENAI_API_KEY", "environment variable containing the API key")
+	apiKeyEnv := fs.String("api-key-env", "", "environment variable containing the API key")
 	maxSteps := fs.Int("max-steps", 0, "maximum ReAct steps for this task")
+	scheduled := fs.Bool("scheduled", false, "run through the scheduler worker pool")
 	output := fs.String("output", "text", "output format: text/json")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -170,18 +528,22 @@ func taskRun(args []string) error {
 	if *maxSteps > 0 {
 		cfg.Agent.DefaultMaxSteps = *maxSteps
 	}
-	store, err := storage.Open(cfg.Database.Path, storage.SQLiteOptions{QueueSize: cfg.Database.WriteQueueSize})
+	baseStore, err := storage.Open(cfg.Database.Path, storage.SQLiteOptions{QueueSize: cfg.Database.WriteQueueSize})
 	if err != nil {
 		return err
 	}
+	store := newEventRoutedStore(context.Background(), baseStore, cfg)
 	defer store.Close()
 
 	streamID := "task:" + newID()
 	route := workflow.Route(query, *workflowName)
 	workspaceAbs, _ := filepath.Abs(*workspacePath)
-	client, taskModel, err := buildTaskClient(*workerMode, *model, *baseURL, *apiKeyEnv, workspaceAbs, cfg)
+	client, taskModel, err := buildTaskClient(*workerMode, *model, *baseURL, *apiKeyEnv, *workerAddress, workspaceAbs, cfg)
 	if err != nil {
 		return err
+	}
+	if closer, ok := client.(interface{ Close() error }); ok {
+		defer closer.Close()
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.GRPC.ExecuteTimeoutSeconds)*time.Second)
 	defer cancel()
@@ -199,7 +561,7 @@ func taskRun(args []string) error {
 	}); err != nil {
 		return err
 	}
-	result, runErr := workflow.Execute(ctx, store, workflow.NewRegistry(), &workflow.TaskHandle{
+	task := &workflow.TaskHandle{
 		StreamID:     streamID,
 		Mode:         workflow.ContextModeExecution,
 		WorkflowType: route.Workflow,
@@ -212,7 +574,14 @@ func taskRun(args []string) error {
 		Tools:        worker.BuiltinToolDefinitions(),
 		Config:       cfg,
 		Client:       client,
-	})
+	}
+	var result *workflow.TaskResult
+	var runErr error
+	if *scheduled {
+		result, runErr = executeScheduled(ctx, store, cfg, task)
+	} else {
+		result, runErr = workflow.Execute(ctx, store, workflow.NewRegistry(), task)
+	}
 	if runErr != nil {
 		return runErr
 	}
@@ -233,7 +602,24 @@ func taskRun(args []string) error {
 	return nil
 }
 
-func buildTaskClient(mode, model, baseURL, apiKeyEnv, workspace string, cfg *config.RuntimeConfig) (worker.Client, string, error) {
+func executeScheduled(ctx context.Context, store storage.Store, cfg *config.RuntimeConfig, task *workflow.TaskHandle) (*workflow.TaskResult, error) {
+	s := scheduler.New(store, workflow.NewRegistry(), cfg.Workflow.MaxConcurrentTasks, cfg.Scheduler.QueueSize)
+	defer s.Stop()
+	if err := s.Submit(ctx, task); err != nil {
+		return nil, err
+	}
+	select {
+	case result := <-s.Results():
+		if result == nil {
+			return nil, fmt.Errorf("scheduler returned nil result")
+		}
+		return result, result.Err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func buildTaskClient(mode, model, baseURL, apiKeyEnv, workerAddress, workspace string, cfg *config.RuntimeConfig) (worker.Client, string, error) {
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	if mode == "" {
 		mode = "echo"
@@ -242,25 +628,10 @@ func buildTaskClient(mode, model, baseURL, apiKeyEnv, workspace string, cfg *con
 	case "echo":
 		return worker.NewLocalAgentClient(worker.NewEchoClient(), workspace, cfg.Safety.ShellDangerousPatterns), model, nil
 	case "openai":
-		provider := findOpenAIProvider(cfg)
-		resolvedBaseURL := strings.TrimSpace(baseURL)
-		if resolvedBaseURL == "" && provider != nil {
-			resolvedBaseURL = provider.BaseURL
-		}
-		apiKeyName := strings.TrimSpace(apiKeyEnv)
-		if apiKeyName == "" {
-			apiKeyName = "OPENAI_API_KEY"
-		}
-		apiKey := strings.TrimSpace(os.Getenv(apiKeyName))
-		if apiKey == "" && provider != nil {
-			apiKey = provider.APIKey
-		}
+		provider := findLLMProvider(cfg, "openai")
+		resolvedBaseURL, apiKey, resolvedModel := resolveLLMOptions(provider, model, baseURL, apiKeyEnv, "OPENAI_API_KEY", worker.DefaultOpenAIModel)
 		if apiKey == "" {
-			return nil, "", fmt.Errorf("--worker openai requires %s or an llm_providers api_key", apiKeyName)
-		}
-		resolvedModel := strings.TrimSpace(model)
-		if resolvedModel == "" && provider != nil {
-			resolvedModel = provider.DefaultModel
+			return nil, "", fmt.Errorf("--worker openai requires %s or an llm_providers api_key", defaultEnvName(apiKeyEnv, "OPENAI_API_KEY"))
 		}
 		generator, err := worker.NewOpenAIClient(worker.OpenAIConfig{
 			BaseURL: resolvedBaseURL,
@@ -271,22 +642,123 @@ func buildTaskClient(mode, model, baseURL, apiKeyEnv, workspace string, cfg *con
 			return nil, "", err
 		}
 		return worker.NewLocalAgentClient(generator, workspace, cfg.Safety.ShellDangerousPatterns), resolvedModel, nil
+	case "deepseek":
+		provider := findLLMProvider(cfg, "deepseek")
+		resolvedBaseURL, apiKey, resolvedModel := resolveLLMOptions(provider, model, baseURL, apiKeyEnv, "DEEPSEEK_API_KEY", worker.DefaultDeepSeekModel)
+		if apiKey == "" {
+			return nil, "", fmt.Errorf("--worker deepseek requires %s or a deepseek llm_providers api_key", defaultEnvName(apiKeyEnv, "DEEPSEEK_API_KEY"))
+		}
+		generator, err := worker.NewDeepSeekClient(worker.OpenAIConfig{
+			BaseURL: resolvedBaseURL,
+			APIKey:  apiKey,
+			Model:   resolvedModel,
+		})
+		if err != nil {
+			return nil, "", err
+		}
+		return worker.NewLocalAgentClient(generator, workspace, cfg.Safety.ShellDangerousPatterns), resolvedModel, nil
+	case "grpc":
+		address := strings.TrimSpace(workerAddress)
+		if address == "" {
+			address = fmt.Sprintf("127.0.0.1:%d", cfg.GRPC.WorkerPort)
+		}
+		client, err := gateway.NewWorkerClient(gateway.ClientOptions{
+			Address:               address,
+			ControlTimeout:        time.Duration(cfg.GRPC.ControlTimeoutSeconds) * time.Second,
+			ExecuteTimeout:        time.Duration(cfg.GRPC.ExecuteTimeoutSeconds) * time.Second,
+			RetryMaxAttempts:      cfg.GRPC.RetryMaxAttempts,
+			RetryBackoffBase:      durationOrDefault(cfg.GRPC.RetryBackoffBaseMS, 1000),
+			CircuitBreakerFailMax: cfg.GRPC.CircuitBreakerThreshold,
+			CircuitBreakerTimeout: time.Duration(cfg.GRPC.CircuitBreakerTimeout) * time.Second,
+		})
+		if err != nil {
+			return nil, "", err
+		}
+		resolvedModel := strings.TrimSpace(model)
+		if resolvedModel == "" {
+			resolvedModel = "python-worker"
+		}
+		return client, resolvedModel, nil
 	default:
 		return nil, "", fmt.Errorf("unknown worker mode %q", mode)
 	}
 }
 
-func findOpenAIProvider(cfg *config.RuntimeConfig) *config.LLMProvider {
+func durationOrDefault(ms int, fallback int) time.Duration {
+	if ms <= 0 {
+		ms = fallback
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func zeroFencingLease() guard.FencingLease {
+	return guard.FencingLease{}
+}
+
+func newEventRoutedStore(ctx context.Context, base storage.Store, cfg *config.RuntimeConfig) storage.Store {
+	stream := newStreamChannel(ctx, cfg)
+	return eventrouter.New(base, stream)
+}
+
+func newStreamChannel(ctx context.Context, cfg *config.RuntimeConfig) eventrouter.StreamChannel {
+	if cfg == nil || cfg.Redis.Addr == "" {
+		return eventrouter.NewMemoryStream()
+	}
+	client := redis.NewClient(&redis.Options{
+		Addr:        cfg.Redis.Addr,
+		Password:    cfg.Redis.Password,
+		DB:          cfg.Redis.DB,
+		DialTimeout: 200 * time.Millisecond,
+		ReadTimeout: 200 * time.Millisecond,
+	})
+	pingCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	defer cancel()
+	if err := client.Ping(pingCtx).Err(); err != nil {
+		_ = client.Close()
+		return eventrouter.NewMemoryStream()
+	}
+	return eventrouter.NewRedisStream(client)
+}
+
+func resolveLLMOptions(provider *config.LLMProvider, model, baseURL, apiKeyEnv, fallbackAPIKeyEnv, fallbackModel string) (string, string, string) {
+	resolvedBaseURL := strings.TrimSpace(baseURL)
+	if resolvedBaseURL == "" && provider != nil {
+		resolvedBaseURL = provider.BaseURL
+	}
+	apiKeyName := defaultEnvName(apiKeyEnv, fallbackAPIKeyEnv)
+	apiKey := strings.TrimSpace(os.Getenv(apiKeyName))
+	if apiKey == "" && provider != nil {
+		apiKey = provider.APIKey
+	}
+	resolvedModel := strings.TrimSpace(model)
+	if resolvedModel == "" && provider != nil {
+		resolvedModel = provider.DefaultModel
+	}
+	if resolvedModel == "" {
+		resolvedModel = fallbackModel
+	}
+	return resolvedBaseURL, apiKey, resolvedModel
+}
+
+func defaultEnvName(apiKeyEnv, fallback string) string {
+	apiKeyName := strings.TrimSpace(apiKeyEnv)
+	if apiKeyName == "" {
+		apiKeyName = fallback
+	}
+	return apiKeyName
+}
+
+func findLLMProvider(cfg *config.RuntimeConfig, name string) *config.LLMProvider {
 	if cfg == nil {
 		return nil
 	}
 	for i := range cfg.LLM {
 		provider := &cfg.LLM[i]
-		if strings.EqualFold(provider.Adapter, "openai") || strings.EqualFold(provider.Name, "openai") {
+		if strings.EqualFold(provider.Adapter, name) || strings.EqualFold(provider.Name, name) {
 			return provider
 		}
 	}
-	if len(cfg.LLM) > 0 {
+	if name == "openai" && len(cfg.LLM) > 0 {
 		return &cfg.LLM[0]
 	}
 	return nil
@@ -356,6 +828,342 @@ func taskInspect(args []string) error {
 	for _, evt := range events {
 		fmt.Printf("%03d %s %s\n%s\n", evt.StreamSeq, evt.Timestamp.Format(time.RFC3339), evt.EventType, evt.Payload)
 	}
+	return nil
+}
+
+func taskWatch(args []string) error {
+	fs := flag.NewFlagSet("task watch", flag.ContinueOnError)
+	configPath := fs.String("config", "config/tenet.yaml", "path to configuration file")
+	streamID := fs.String("stream", "", "stream id")
+	fromSeq := fs.Int64("from", 1, "first stream sequence to print")
+	follow := fs.Bool("follow", false, "continue polling for new events")
+	interval := fs.Duration("interval", 500*time.Millisecond, "poll interval when --follow is set")
+	output := fs.String("output", "text", "output format: text/jsonl")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *streamID == "" {
+		return fmt.Errorf("--stream is required")
+	}
+	cfg, err := loadConfig(*configPath, true)
+	if err != nil {
+		return err
+	}
+	store, err := storage.Open(cfg.Database.Path, storage.SQLiteOptions{QueueSize: cfg.Database.WriteQueueSize})
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	nextSeq := *fromSeq
+	for {
+		events, err := store.Read(*streamID, nextSeq)
+		if err != nil {
+			return err
+		}
+		for _, evt := range events {
+			if err := printWatchEvent(evt, *output); err != nil {
+				return err
+			}
+			nextSeq = evt.StreamSeq + 1
+		}
+		if !*follow {
+			return nil
+		}
+		wait := *interval
+		if wait <= 0 {
+			wait = 500 * time.Millisecond
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
+	}
+}
+
+func taskStatus(args []string) error {
+	fs := flag.NewFlagSet("task status", flag.ContinueOnError)
+	configPath := fs.String("config", "config/tenet.yaml", "path to configuration file")
+	streamID := fs.String("stream", "", "stream id")
+	output := fs.String("output", "text", "output format: text/json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *streamID == "" {
+		return fmt.Errorf("--stream is required")
+	}
+	cfg, err := loadConfig(*configPath, true)
+	if err != nil {
+		return err
+	}
+	store, err := storage.Open(cfg.Database.Path, storage.SQLiteOptions{QueueSize: cfg.Database.WriteQueueSize})
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	view, err := projection.NewEngine(store, cfg).ProjectTask(*streamID)
+	if err != nil {
+		return err
+	}
+	if *output == "json" {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(view)
+	}
+	fmt.Printf("task_id:       %s\n", view.StreamID)
+	fmt.Printf("status:        %s\n", view.Status)
+	if view.WorkflowType != "" {
+		fmt.Printf("workflow:      %s\n", view.WorkflowType)
+	}
+	fmt.Printf("progress:      %d/%d\n", view.Progress.CompletedSteps, view.Progress.TotalSteps)
+	fmt.Printf("timeline:      %d steps\n", view.Timeline.TotalSteps)
+	fmt.Printf("tokens:        %d/%d\n", view.Tokens.TotalTokens, view.Tokens.BudgetLimit)
+	if view.FinalAnswer != "" {
+		fmt.Printf("final_answer:  %s\n", view.FinalAnswer)
+	}
+	if view.Error != "" {
+		fmt.Printf("error:         %s\n", view.Error)
+	}
+	return nil
+}
+
+func taskFork(args []string) error {
+	fs := flag.NewFlagSet("task fork", flag.ContinueOnError)
+	configPath := fs.String("config", "config/tenet.yaml", "path to configuration file")
+	streamID := fs.String("stream", "", "parent stream id")
+	seq := fs.Int64("seq", 0, "fork after this stream sequence")
+	query := fs.String("query", "", "new query for the fork")
+	restoreWorkspace := fs.Bool("restore-workspace", true, "initialize fork workspace from the latest snapshot before --seq")
+	output := fs.String("output", "text", "output format: text/json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *streamID == "" {
+		return fmt.Errorf("--stream is required")
+	}
+	if *seq <= 0 {
+		return fmt.Errorf("--seq must be positive")
+	}
+	cfg, err := loadConfig(*configPath, true)
+	if err != nil {
+		return err
+	}
+	store, err := storage.Open(cfg.Database.Path, storage.SQLiteOptions{QueueSize: cfg.Database.WriteQueueSize})
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	var fork workspacepkg.ForkResult
+	if *restoreWorkspace {
+		fork, err = workspacepkg.NewManager(cfg).ForkWorkspace(context.Background(), store, *streamID, *seq, *query, nil, zeroFencingLease())
+		if err != nil {
+			return err
+		}
+	} else {
+		childID, err := store.ForkStream(context.Background(), *streamID, *seq, *query)
+		if err != nil {
+			return err
+		}
+		fork = workspacepkg.ForkResult{
+			StreamID:  childID,
+			ParentID:  *streamID,
+			ForkAtSeq: *seq,
+		}
+	}
+	if *output == "json" {
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"stream_id":   fork.StreamID,
+			"parent_id":   *streamID,
+			"fork_at_seq": *seq,
+			"new_query":   *query,
+			"workspace":   fork.Workspace,
+			"restored":    fork.Restored,
+			"snapshot":    fork.Snapshot,
+		})
+	}
+	fmt.Printf("fork:      %s\n", fork.StreamID)
+	fmt.Printf("parent:    %s\n", *streamID)
+	fmt.Printf("fork_seq:  %d\n", *seq)
+	if fork.Workspace != "" {
+		fmt.Printf("workspace: %s\n", fork.Workspace)
+		fmt.Printf("restored:  %t\n", fork.Restored)
+	}
+	if fork.Snapshot != nil {
+		fmt.Printf("snapshot:  %s %s\n", fork.Snapshot.Type, fork.Snapshot.Ref)
+	}
+	return nil
+}
+
+func taskLineage(args []string) error {
+	fs := flag.NewFlagSet("task lineage", flag.ContinueOnError)
+	configPath := fs.String("config", "config/tenet.yaml", "path to configuration file")
+	streamID := fs.String("stream", "", "stream id")
+	output := fs.String("output", "text", "output format: text/json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *streamID == "" {
+		return fmt.Errorf("--stream is required")
+	}
+	cfg, err := loadConfig(*configPath, true)
+	if err != nil {
+		return err
+	}
+	store, err := storage.Open(cfg.Database.Path, storage.SQLiteOptions{QueueSize: cfg.Database.WriteQueueSize})
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	lineage, err := store.GetLineage(*streamID)
+	if err != nil {
+		return err
+	}
+	children, err := store.GetChildStreams(*streamID)
+	if err != nil {
+		return err
+	}
+	if *output == "json" {
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"stream_id": *streamID,
+			"lineage":   lineage,
+			"children":  children,
+		})
+	}
+	fmt.Printf("stream:   %s\n", *streamID)
+	fmt.Printf("lineage:  %s\n", strings.Join(lineage, " -> "))
+	if len(children) > 0 {
+		fmt.Printf("children: %s\n", strings.Join(children, ", "))
+	}
+	return nil
+}
+
+func taskLogs(args []string) error {
+	return taskWatch(args)
+}
+
+func taskCancel(args []string) error {
+	fs := flag.NewFlagSet("task cancel", flag.ContinueOnError)
+	configPath := fs.String("config", "config/tenet.yaml", "path to configuration file")
+	streamID := fs.String("stream", "", "stream id")
+	reason := fs.String("reason", "cancelled by user", "cancel reason")
+	output := fs.String("output", "text", "output format: text/json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *streamID == "" {
+		return fmt.Errorf("--stream is required")
+	}
+	cfg, err := loadConfig(*configPath, true)
+	if err != nil {
+		return err
+	}
+	store, err := storage.Open(cfg.Database.Path, storage.SQLiteOptions{QueueSize: cfg.Database.WriteQueueSize})
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	event, err := store.AppendEvent(context.Background(), storage.AppendEvent{
+		StreamID:  *streamID,
+		EventType: "TaskCancelled",
+		Payload:   map[string]any{"reason": *reason},
+	})
+	if err != nil {
+		return err
+	}
+	if *output == "json" {
+		return json.NewEncoder(os.Stdout).Encode(eventrouter.FromStorageEvent(event))
+	}
+	fmt.Printf("cancelled: %s seq=%d\n", *streamID, event.StreamSeq)
+	return nil
+}
+
+func taskResume(args []string) error {
+	fs := flag.NewFlagSet("task resume", flag.ContinueOnError)
+	configPath := fs.String("config", "config/tenet.yaml", "path to configuration file")
+	streamID := fs.String("stream", "", "stream id")
+	note := fs.String("note", "resume requested", "resume note")
+	after := fs.Duration("after", 0, "delay before resuming, for example 500ms or 10s")
+	output := fs.String("output", "text", "output format: text/json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *streamID == "" {
+		return fmt.Errorf("--stream is required")
+	}
+	cfg, err := loadConfig(*configPath, true)
+	if err != nil {
+		return err
+	}
+	store, err := storage.Open(cfg.Database.Path, storage.SQLiteOptions{QueueSize: cfg.Database.WriteQueueSize})
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if *after > 0 {
+		service := timerpkg.NewService(store)
+		timerID := fmt.Sprintf("resume:%d", time.Now().UTC().UnixNano())
+		done, err := service.Schedule(context.Background(), timerpkg.ScheduleRequest{
+			StreamID:           *streamID,
+			TimerID:            timerID,
+			Delay:              *after,
+			ScheduledEventType: "TaskResumeScheduled",
+			FiredEventType:     "TimerFired",
+			Payload:            map[string]any{"note": *note},
+		})
+		if err != nil {
+			return err
+		}
+		result := <-done
+		if result.Err != nil {
+			return result.Err
+		}
+		event, err := store.AppendEvent(context.Background(), storage.AppendEvent{
+			StreamID:  *streamID,
+			EventType: "TaskResumed",
+			Payload: map[string]any{
+				"note":     *note,
+				"timer_id": timerID,
+			},
+		})
+		if err != nil {
+			return err
+		}
+		if *output == "json" {
+			return json.NewEncoder(os.Stdout).Encode(map[string]any{
+				"scheduled": eventrouter.FromStorageEvent(result.Scheduled),
+				"fired":     eventrouter.FromStorageEvent(result.Fired),
+				"resumed":   eventrouter.FromStorageEvent(event),
+			})
+		}
+		fmt.Printf("resume_scheduled: %s seq=%d\n", *streamID, result.Scheduled.StreamSeq)
+		fmt.Printf("timer_fired:      %s seq=%d\n", *streamID, result.Fired.StreamSeq)
+		fmt.Printf("resumed:          %s seq=%d\n", *streamID, event.StreamSeq)
+		return nil
+	}
+	event, err := store.AppendEvent(context.Background(), storage.AppendEvent{
+		StreamID:  *streamID,
+		EventType: "TaskResumed",
+		Payload:   map[string]any{"note": *note},
+	})
+	if err != nil {
+		return err
+	}
+	if *output == "json" {
+		return json.NewEncoder(os.Stdout).Encode(eventrouter.FromStorageEvent(event))
+	}
+	fmt.Printf("resumed: %s seq=%d\n", *streamID, event.StreamSeq)
+	return nil
+}
+
+func printWatchEvent(evt storage.Event, output string) error {
+	if output == "jsonl" || output == "json" {
+		return json.NewEncoder(os.Stdout).Encode(eventrouter.FromStorageEvent(evt))
+	}
+	fmt.Printf("%03d %s %s %s\n", evt.StreamSeq, evt.Timestamp.Format(time.RFC3339), evt.EventType, evt.Payload)
 	return nil
 }
 

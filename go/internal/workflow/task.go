@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/tenet/orchestrator/internal/config"
+	"github.com/tenet/orchestrator/internal/guard"
 	"github.com/tenet/orchestrator/internal/storage"
 	"github.com/tenet/orchestrator/internal/worker"
 )
@@ -30,7 +33,12 @@ type TaskHandle struct {
 	Model        string
 	Config       *config.RuntimeConfig
 	Client       worker.Client
+	LockManager  guard.LockManager
+	RateLimiter  guard.RateLimiter
 	Subtasks     []*TaskHandle
+
+	lockMu       sync.RWMutex
+	fencingLease guard.FencingLease
 }
 
 type TaskResult struct {
@@ -90,6 +98,9 @@ func Execute(ctx context.Context, store storage.Store, registry *Registry, task 
 	if task.SessionID == "" {
 		task.SessionID = task.StreamID
 	}
+	if task.AgentRole == "" {
+		task.AgentRole = "default"
+	}
 	if task.Workspace == "" {
 		task.Workspace = "."
 	}
@@ -102,15 +113,25 @@ func Execute(ctx context.Context, store storage.Store, registry *Registry, task 
 		fn, _ = registry.Get("simple")
 		task.WorkflowType = "simple"
 	}
-	wfctx, err := NewContext(ctx, store, task.StreamID, task.ParentID, task.Mode, task.Config)
+	runCtx := ctx
+	var release func()
+	if task.Mode == ContextModeExecution {
+		var err error
+		runCtx, release, err = task.acquireSessionLease(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+	}
+	wfctx, err := NewContext(runCtx, store, task.StreamID, task.ParentID, task.Mode, task.Config)
 	if err != nil {
 		return nil, err
 	}
-	result, runErr := fn(ctx, wfctx, task)
+	result, runErr := fn(runCtx, wfctx, task)
 	if runErr != nil {
-		_ = wfctx.Record(ctx, "TaskFailed", map[string]any{"error": runErr.Error()})
+		_ = wfctx.Record(runCtx, "TaskFailed", map[string]any{"error": runErr.Error()})
 	}
-	if err := wfctx.Commit(ctx); err != nil {
+	if err := wfctx.Commit(runCtx); err != nil {
 		return nil, err
 	}
 	return &TaskResult{
@@ -119,6 +140,93 @@ func Execute(ctx context.Context, store storage.Store, registry *Registry, task 
 		Result:   result,
 		Err:      runErr,
 	}, runErr
+}
+
+func (task *TaskHandle) acquireSessionLease(ctx context.Context) (context.Context, func(), error) {
+	if task.LockManager == nil {
+		task.LockManager = guard.NewConfiguredLockManager(ctx, task.Config)
+	}
+	if task.RateLimiter == nil {
+		task.RateLimiter = guard.NewConfiguredRateLimiter(ctx, task.Config)
+	}
+	lease, err := task.LockManager.Acquire(ctx, task.SessionID, task.AgentRole)
+	if err != nil {
+		return nil, nil, err
+	}
+	task.setFencingLease(lease)
+
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	heartbeat := time.Duration(task.Config.Redis.SessionHeartbeatSeconds) * time.Second
+	if heartbeat <= 0 {
+		heartbeat = 10 * time.Second
+	}
+	go task.renewSessionLease(runCtx, heartbeat, cancel, done)
+
+	release := func() {
+		close(done)
+		cancel()
+		_ = task.LockManager.Release(context.Background(), task.CurrentFencingLease())
+	}
+	return runCtx, release, nil
+}
+
+func (task *TaskHandle) renewSessionLease(ctx context.Context, heartbeat time.Duration, cancel context.CancelFunc, done <-chan struct{}) {
+	ticker := time.NewTicker(heartbeat)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			lease, err := task.LockManager.Renew(ctx, task.CurrentFencingLease())
+			if err != nil {
+				cancel()
+				return
+			}
+			task.setFencingLease(lease)
+		}
+	}
+}
+
+func (task *TaskHandle) setFencingLease(lease guard.FencingLease) {
+	task.lockMu.Lock()
+	defer task.lockMu.Unlock()
+	task.fencingLease = lease
+}
+
+func (task *TaskHandle) CurrentFencingLease() guard.FencingLease {
+	task.lockMu.RLock()
+	defer task.lockMu.RUnlock()
+	return task.fencingLease
+}
+
+func (task *TaskHandle) CurrentFencingToken() int64 {
+	lease := task.CurrentFencingLease()
+	if !lease.FencingRequired {
+		return 0
+	}
+	return lease.Token
+}
+
+func (task *TaskHandle) ValidateFencingLease(ctx context.Context) error {
+	if task.LockManager == nil {
+		return nil
+	}
+	lease := task.CurrentFencingLease()
+	if lease.SessionID == "" || !lease.FencingRequired {
+		return nil
+	}
+	return task.LockManager.Validate(ctx, lease)
+}
+
+func (task *TaskHandle) CheckToolRateLimit(ctx context.Context, toolName string) error {
+	if task.RateLimiter == nil {
+		return nil
+	}
+	return task.RateLimiter.Allow(ctx, toolName)
 }
 
 func coerce[T any](value any) (T, error) {

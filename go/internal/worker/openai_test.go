@@ -115,3 +115,16 @@ func TestOpenAIClientGenerateThoughtToolCallResponse(t *testing.T) {
 		t.Fatalf("tool call = %+v", call)
 	}
 }
+
+func TestDeepSeekClientDefaults(t *testing.T) {
+	client, err := NewDeepSeekClient(OpenAIConfig{APIKey: "deepseek-key"})
+	if err != nil {
+		t.Fatalf("new deepseek client: %v", err)
+	}
+	if client.baseURL != DefaultDeepSeekBaseURL {
+		t.Fatalf("baseURL = %q, want %q", client.baseURL, DefaultDeepSeekBaseURL)
+	}
+	if client.model != DefaultDeepSeekModel {
+		t.Fatalf("model = %q, want %q", client.model, DefaultDeepSeekModel)
+	}
+}

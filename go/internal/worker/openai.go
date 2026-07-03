@@ -13,8 +13,12 @@ import (
 	"time"
 )
 
-const defaultOpenAIBaseURL = "https://api.openai.com/v1"
-const defaultOpenAIModel = "gpt-4o-mini"
+const (
+	DefaultOpenAIBaseURL   = "https://api.openai.com/v1"
+	DefaultOpenAIModel     = "gpt-4o-mini"
+	DefaultDeepSeekBaseURL = "https://api.deepseek.com"
+	DefaultDeepSeekModel   = "deepseek-v4-flash"
+)
 
 type OpenAIConfig struct {
 	BaseURL    string
@@ -34,7 +38,7 @@ type OpenAIClient struct {
 func NewOpenAIClient(cfg OpenAIConfig) (*OpenAIClient, error) {
 	baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
 	if baseURL == "" {
-		baseURL = defaultOpenAIBaseURL
+		baseURL = DefaultOpenAIBaseURL
 	}
 	apiKey := strings.TrimSpace(cfg.APIKey)
 	if apiKey == "" {
@@ -42,7 +46,7 @@ func NewOpenAIClient(cfg OpenAIConfig) (*OpenAIClient, error) {
 	}
 	model := strings.TrimSpace(cfg.Model)
 	if model == "" {
-		model = defaultOpenAIModel
+		model = DefaultOpenAIModel
 	}
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
@@ -61,6 +65,24 @@ func NewOpenAIClientFromEnv(model string) (*OpenAIClient, error) {
 	return NewOpenAIClient(OpenAIConfig{
 		BaseURL: os.Getenv("OPENAI_BASE_URL"),
 		APIKey:  os.Getenv("OPENAI_API_KEY"),
+		Model:   model,
+	})
+}
+
+func NewDeepSeekClient(cfg OpenAIConfig) (*OpenAIClient, error) {
+	if strings.TrimSpace(cfg.BaseURL) == "" {
+		cfg.BaseURL = DefaultDeepSeekBaseURL
+	}
+	if strings.TrimSpace(cfg.Model) == "" {
+		cfg.Model = DefaultDeepSeekModel
+	}
+	return NewOpenAIClient(cfg)
+}
+
+func NewDeepSeekClientFromEnv(model string) (*OpenAIClient, error) {
+	return NewDeepSeekClient(OpenAIConfig{
+		BaseURL: os.Getenv("DEEPSEEK_BASE_URL"),
+		APIKey:  os.Getenv("DEEPSEEK_API_KEY"),
 		Model:   model,
 	})
 }

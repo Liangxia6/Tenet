@@ -3,6 +3,11 @@ name = "tenet"
 version = "0.1.0"
 description = "Stateless Tenet Python worker"
 requires-python = ">=3.10"
+dependencies = [
+  "grpcio>=1.81.1",
+  "protobuf>=6.31",
+  "redis>=5.0",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -100,3 +100,100 @@ func TestReplaySkipsDecisionFunction(t *testing.T) {
 		t.Fatalf("result = %v, want cached", result)
 	}
 }
+
+func TestGetVersionRecordsAndReplaysMarker(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	store := testStore(t)
+	defer store.Close()
+	wfctx, err := NewContext(ctx, store, "task:version", "", ContextModeExecution, testConfig())
+	if err != nil {
+		t.Fatalf("new context: %v", err)
+	}
+	if got := wfctx.GetVersion("add-feature", 2); got != 2 {
+		t.Fatalf("version = %d, want 2", got)
+	}
+	if err := wfctx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	events, err := store.Read("task:version", 1)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(events) != 1 || events[0].EventType != "VersionMarker" {
+		t.Fatalf("events = %+v", events)
+	}
+	replay, err := NewContext(ctx, store, "task:version", "", ContextModeReplay, testConfig())
+	if err != nil {
+		t.Fatalf("new replay: %v", err)
+	}
+	if got := replay.GetVersion("add-feature", 2); got != 2 {
+		t.Fatalf("replay version = %d, want 2", got)
+	}
+	if replay.HistoryLength() != 0 {
+		t.Fatalf("version marker should be removed from replay history")
+	}
+}
+
+func TestGetVersionDefaultsOldReplayToOne(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	store := testStore(t)
+	defer store.Close()
+	if _, err := store.AppendEvent(ctx, storage.AppendEvent{StreamID: "task:old", EventType: "TaskStarted", Payload: map[string]any{}}); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	replay, err := NewContext(ctx, store, "task:old", "", ContextModeReplay, testConfig())
+	if err != nil {
+		t.Fatalf("new replay: %v", err)
+	}
+	if got := replay.GetVersion("new-change", 3); got != 1 {
+		t.Fatalf("old replay version = %d, want 1", got)
+	}
+}
+
+func TestSleepRecordsTimerAndReplayDoesNotWait(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	store := testStore(t)
+	defer store.Close()
+	wfctx, err := NewContext(ctx, store, "task:timer", "", ContextModeExecution, testConfig())
+	if err != nil {
+		t.Fatalf("new context: %v", err)
+	}
+	if err := wfctx.Sleep(ctx, "short", 5*time.Millisecond); err != nil {
+		t.Fatalf("sleep: %v", err)
+	}
+	if err := wfctx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	assertWorkflowEvents(t, store, "task:timer", "TimerScheduled", "TimerFired")
+
+	replay, err := NewContext(ctx, store, "task:timer", "", ContextModeReplay, testConfig())
+	if err != nil {
+		t.Fatalf("new replay: %v", err)
+	}
+	start := time.Now()
+	if err := replay.Sleep(ctx, "short", time.Hour); err != nil {
+		t.Fatalf("replay sleep: %v", err)
+	}
+	if time.Since(start) > 50*time.Millisecond {
+		t.Fatalf("replay sleep waited too long")
+	}
+}
+
+func assertWorkflowEvents(t *testing.T, store storage.Store, streamID string, wants ...string) {
+	t.Helper()
+	events, err := store.Read(streamID, 1)
+	if err != nil {
+		t.Fatalf("read events: %v", err)
+	}
+	if len(events) != len(wants) {
+		t.Fatalf("events len = %d, want %d: %+v", len(events), len(wants), events)
+	}
+	for i, want := range wants {
+		if events[i].EventType != want {
+			t.Fatalf("event %d = %s, want %s", i, events[i].EventType, want)
+		}
+	}
+}

@@ -50,6 +50,7 @@ message ExecuteToolRequest {
   int64 fencing_token = 2;
   string tool_name = 3;
   string arguments = 4;
+  string workspace = 5;
 }
 
 message ExecuteToolResponse {

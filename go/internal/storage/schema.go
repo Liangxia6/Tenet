@@ -39,6 +39,13 @@ func InitSchema(db *sql.DB) error {
 			state_blob TEXT NOT NULL,
 			created_at TEXT NOT NULL DEFAULT (datetime('now'))
 		)`,
+		`CREATE TABLE IF NOT EXISTS projection_snapshots (
+			stream_id TEXT PRIMARY KEY NOT NULL,
+			stream_seq INTEGER NOT NULL,
+			state_blob TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+		)`,
 		`CREATE TABLE IF NOT EXISTS token_telemetry (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			session_id TEXT NOT NULL,
@@ -64,6 +71,7 @@ func InitSchema(db *sql.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)",
 		"CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions(created_at)",
 		"CREATE INDEX IF NOT EXISTS idx_snapshots_stream_id_seq ON snapshots(stream_id, stream_seq DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_projection_snapshots_seq ON projection_snapshots(stream_id, stream_seq DESC)",
 		"CREATE INDEX IF NOT EXISTS idx_token_telemetry_task ON token_telemetry(task_id)",
 	}
 	for _, statement := range statements {

@@ -1,15 +1,15 @@
 package config
 
 import (
-    "os"
-    "path/filepath"
-    "testing"
+	"os"
+	"path/filepath"
+	"testing"
 )
 
 func TestLoad(t *testing.T) {
-    dir := t.TempDir()
-    path := filepath.Join(dir, "tenet.yaml")
-    if err := os.WriteFile(path, []byte(`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tenet.yaml")
+	if err := os.WriteFile(path, []byte(`
         database:
           path: data/tenet.db
           max_open_conns: 1
@@ -91,30 +91,44 @@ func TestLoad(t *testing.T) {
           format: json
           output: stdout
     `), 0600); err != nil {
-        t.Fatalf("write config: %v", err)
-    }
+		t.Fatalf("write config: %v", err)
+	}
 
-    t.Setenv("OPENAI_API_KEY", "dummy-key")
+	t.Setenv("OPENAI_API_KEY", "dummy-key")
 
-    cfg, err := Load(path)
-    if err != nil {
-        t.Fatalf("Load() error = %v", err)
-    }
-    if cfg.Database.Path != "data/tenet.db" {
-        t.Errorf("unexpected database path: %s", cfg.Database.Path)
-    }
-    if cfg.Redis.Password != "" {
-        t.Errorf("expected empty redis password, got %q", cfg.Redis.Password)
-    }
-    if cfg.LLM[0].APIKey != "dummy-key" {
-        t.Errorf("expected env resolved api key, got %q", cfg.LLM[0].APIKey)
-    }
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Database.Path != "data/tenet.db" {
+		t.Errorf("unexpected database path: %s", cfg.Database.Path)
+	}
+	if cfg.Redis.Password != "" {
+		t.Errorf("expected empty redis password, got %q", cfg.Redis.Password)
+	}
+	if cfg.LLM[0].APIKey != "dummy-key" {
+		t.Errorf("expected env resolved api key, got %q", cfg.LLM[0].APIKey)
+	}
+}
+
+func TestLoadExampleConfig(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "config", "tenet.example.yaml")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load example config: %v", err)
+	}
+	if cfg.Database.Path == "" || cfg.Workspace.BasePath == "" {
+		t.Fatalf("example config missing required paths: %+v", cfg)
+	}
+	if len(cfg.LLM) < 2 {
+		t.Fatalf("example config should include deepseek and openai providers")
+	}
 }
 
 func TestLoadMissingEnv(t *testing.T) {
-    dir := t.TempDir()
-    path := filepath.Join(dir, "tenet.yaml")
-    if err := os.WriteFile(path, []byte(`
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tenet.yaml")
+	if err := os.WriteFile(path, []byte(`
         database:
           path: data/tenet.db
           max_open_conns: 1
@@ -188,10 +202,10 @@ func TestLoadMissingEnv(t *testing.T) {
           format: json
           output: stdout
     `), 0600); err != nil {
-        t.Fatalf("write config: %v", err)
-    }
+		t.Fatalf("write config: %v", err)
+	}
 
-    if _, err := Load(path); err == nil {
-        t.Fatalf("expected error for missing env var")
-    }
+	if _, err := Load(path); err == nil {
+		t.Fatalf("expected error for missing env var")
+	}
 }

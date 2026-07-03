@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -27,9 +28,42 @@ type Store interface {
 	AppendEvent(ctx context.Context, event AppendEvent) (Event, error)
 	AppendEvents(ctx context.Context, events []AppendEvent) ([]Event, error)
 	Append(ctx context.Context, req *WriteRequest) (*WriteResult, error)
+	SaveSnapshot(ctx context.Context, snapshot SnapshotRecord) (SnapshotRecord, error)
+	LatestSnapshot(streamID string, maxSeq int64) (SnapshotRecord, error)
+	SaveProjectionSnapshot(ctx context.Context, snapshot ProjectionSnapshot) (ProjectionSnapshot, error)
+	LatestProjectionSnapshot(streamID string) (ProjectionSnapshot, error)
+	ForkStream(ctx context.Context, parentStreamID string, forkFromSeq int64, newQuery string) (string, error)
+	GetLineage(streamID string) ([]string, error)
+	GetChildStreams(streamID string) ([]string, error)
+	ListStreams(limit int) ([]StreamSummary, error)
 	Read(streamID string, fromSeq int64) ([]Event, error)
 	LatestSeq(streamID string) (int64, error)
 	Close() error
+}
+
+type StreamSummary struct {
+	StreamID  string
+	LatestSeq int64
+	EventType string
+	Timestamp time.Time
+}
+
+type SnapshotRecord struct {
+	ID        int64
+	StreamID  string
+	StreamSeq int64
+	Type      string
+	Ref       string
+	StateBlob string
+	CreatedAt time.Time
+}
+
+type ProjectionSnapshot struct {
+	StreamID  string
+	StreamSeq int64
+	StateBlob string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 type AppendEvent struct {
@@ -63,6 +97,7 @@ type SQLiteStore struct {
 type writeJob struct {
 	req    *WriteRequest
 	append *appendJob
+	fork   *forkJob
 	result chan resultWithErr
 }
 
@@ -111,6 +146,12 @@ func (s *SQLiteStore) loop() {
 			events, err := s.execAppend(job.append)
 			job.append.result <- appendResult{events: events, err: err}
 			close(job.append.result)
+			continue
+		}
+		if job.fork != nil {
+			streamID, err := s.execFork(job.fork)
+			job.fork.result <- forkResult{streamID: streamID, err: err}
+			close(job.fork.result)
 			continue
 		}
 		res, err := s.exec(job.req)
@@ -186,6 +227,234 @@ func (s *SQLiteStore) Append(ctx context.Context, req *WriteRequest) (*WriteResu
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
+}
+
+func (s *SQLiteStore) SaveSnapshot(ctx context.Context, snapshot SnapshotRecord) (SnapshotRecord, error) {
+	if snapshot.StreamID == "" {
+		return SnapshotRecord{}, fmt.Errorf("stream_id is required")
+	}
+	if snapshot.StreamSeq <= 0 {
+		return SnapshotRecord{}, fmt.Errorf("stream_seq must be positive")
+	}
+	if snapshot.Type != "git" && snapshot.Type != "archive" {
+		return SnapshotRecord{}, fmt.Errorf("unsupported snapshot type %q", snapshot.Type)
+	}
+	if snapshot.Ref == "" {
+		return SnapshotRecord{}, fmt.Errorf("snapshot_ref is required")
+	}
+	if snapshot.StateBlob == "" {
+		snapshot.StateBlob = "{}"
+	}
+	result, err := s.Append(ctx, &WriteRequest{Statements: []WriteStatement{{
+		SQL: `INSERT INTO snapshots(stream_id, stream_seq, snapshot_type, snapshot_ref, state_blob)
+			VALUES(?,?,?,?,?)`,
+		Args: []any{snapshot.StreamID, snapshot.StreamSeq, snapshot.Type, snapshot.Ref, snapshot.StateBlob},
+	}}})
+	if err != nil {
+		return SnapshotRecord{}, err
+	}
+	snapshot.ID = result.LastInsertID
+	snapshot.CreatedAt = time.Now().UTC()
+	return snapshot, nil
+}
+
+func (s *SQLiteStore) LatestSnapshot(streamID string, maxSeq int64) (SnapshotRecord, error) {
+	if streamID == "" {
+		return SnapshotRecord{}, fmt.Errorf("stream_id is required")
+	}
+	if maxSeq <= 0 {
+		maxSeq = 1<<63 - 1
+	}
+	var snapshot SnapshotRecord
+	var createdAt string
+	err := s.db.QueryRow(`
+		SELECT id, stream_id, stream_seq, snapshot_type, snapshot_ref, state_blob, created_at
+		FROM snapshots
+		WHERE stream_id = ? AND stream_seq <= ?
+		ORDER BY stream_seq DESC, id DESC
+		LIMIT 1
+	`, streamID, maxSeq).Scan(
+		&snapshot.ID,
+		&snapshot.StreamID,
+		&snapshot.StreamSeq,
+		&snapshot.Type,
+		&snapshot.Ref,
+		&snapshot.StateBlob,
+		&createdAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return SnapshotRecord{}, sql.ErrNoRows
+	}
+	if err != nil {
+		return SnapshotRecord{}, err
+	}
+	if createdAt != "" {
+		if parsed, err := time.Parse(time.RFC3339, createdAt); err == nil {
+			snapshot.CreatedAt = parsed
+		} else if parsed, err := time.Parse("2006-01-02 15:04:05", createdAt); err == nil {
+			snapshot.CreatedAt = parsed
+		}
+	}
+	return snapshot, nil
+}
+
+func (s *SQLiteStore) SaveProjectionSnapshot(ctx context.Context, snapshot ProjectionSnapshot) (ProjectionSnapshot, error) {
+	if snapshot.StreamID == "" {
+		return ProjectionSnapshot{}, fmt.Errorf("stream_id is required")
+	}
+	if snapshot.StreamSeq <= 0 {
+		return ProjectionSnapshot{}, fmt.Errorf("stream_seq must be positive")
+	}
+	if snapshot.StateBlob == "" {
+		return ProjectionSnapshot{}, fmt.Errorf("state_blob is required")
+	}
+	_, err := s.Append(ctx, &WriteRequest{Statements: []WriteStatement{{
+		SQL: `INSERT INTO projection_snapshots(stream_id, stream_seq, state_blob)
+			VALUES(?,?,?)
+			ON CONFLICT(stream_id) DO UPDATE SET
+				stream_seq = excluded.stream_seq,
+				state_blob = excluded.state_blob,
+				updated_at = datetime('now')`,
+		Args: []any{snapshot.StreamID, snapshot.StreamSeq, snapshot.StateBlob},
+	}}})
+	if err != nil {
+		return ProjectionSnapshot{}, err
+	}
+	now := time.Now().UTC()
+	snapshot.CreatedAt = now
+	snapshot.UpdatedAt = now
+	return snapshot, nil
+}
+
+func (s *SQLiteStore) LatestProjectionSnapshot(streamID string) (ProjectionSnapshot, error) {
+	if streamID == "" {
+		return ProjectionSnapshot{}, fmt.Errorf("stream_id is required")
+	}
+	var snapshot ProjectionSnapshot
+	var createdAt, updatedAt string
+	err := s.db.QueryRow(`
+		SELECT stream_id, stream_seq, state_blob, created_at, updated_at
+		FROM projection_snapshots
+		WHERE stream_id = ?
+		LIMIT 1
+	`, streamID).Scan(&snapshot.StreamID, &snapshot.StreamSeq, &snapshot.StateBlob, &createdAt, &updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ProjectionSnapshot{}, sql.ErrNoRows
+	}
+	if err != nil {
+		return ProjectionSnapshot{}, err
+	}
+	snapshot.CreatedAt = parseSQLiteTime(createdAt)
+	snapshot.UpdatedAt = parseSQLiteTime(updatedAt)
+	return snapshot, nil
+}
+
+func (s *SQLiteStore) ForkStream(ctx context.Context, parentStreamID string, forkFromSeq int64, newQuery string) (string, error) {
+	job := &forkJob{
+		parentStreamID: parentStreamID,
+		forkFromSeq:    forkFromSeq,
+		newQuery:       newQuery,
+		result:         make(chan forkResult, 1),
+	}
+	select {
+	case s.writeCh <- &writeJob{fork: job}:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	select {
+	case out := <-job.result:
+		return out.streamID, out.err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func (s *SQLiteStore) GetLineage(streamID string) ([]string, error) {
+	lineage := []string{}
+	current := streamID
+	for depth := 0; depth < 50 && current != ""; depth++ {
+		lineage = append([]string{current}, lineage...)
+		var parent sql.NullString
+		err := s.db.QueryRow(`
+			SELECT parent_id
+			FROM event_log
+			WHERE stream_id = ?
+			ORDER BY stream_seq ASC
+			LIMIT 1
+		`, current).Scan(&parent)
+		if errors.Is(err, sql.ErrNoRows) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !parent.Valid || parent.String == "" {
+			break
+		}
+		current = parent.String
+	}
+	return lineage, nil
+}
+
+func (s *SQLiteStore) GetChildStreams(streamID string) ([]string, error) {
+	rows, err := s.db.Query(`
+		SELECT DISTINCT stream_id
+		FROM event_log
+		WHERE parent_id = ? AND stream_id != ?
+		ORDER BY stream_id
+	`, streamID, streamID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var children []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		children = append(children, id)
+	}
+	return children, rows.Err()
+}
+
+func (s *SQLiteStore) ListStreams(limit int) ([]StreamSummary, error) {
+	if limit <= 0 {
+		limit = 20
+	}
+	rows, err := s.db.Query(`
+		WITH latest AS (
+			SELECT stream_id, MAX(stream_seq) AS latest_seq
+			FROM event_log
+			GROUP BY stream_id
+		)
+		SELECT e.stream_id, e.stream_seq, e.event_type, e.timestamp
+		FROM event_log e
+		JOIN latest l ON e.stream_id = l.stream_id AND e.stream_seq = l.latest_seq
+		ORDER BY e.id DESC
+		LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var summaries []StreamSummary
+	for rows.Next() {
+		var summary StreamSummary
+		var ts string
+		if err := rows.Scan(&summary.StreamID, &summary.LatestSeq, &summary.EventType, &ts); err != nil {
+			return nil, err
+		}
+		if ts != "" {
+			if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
+				summary.Timestamp = parsed
+			} else if parsed, err := time.Parse("2006-01-02 15:04:05", ts); err == nil {
+				summary.Timestamp = parsed
+			}
+		}
+		summaries = append(summaries, summary)
+	}
+	return summaries, rows.Err()
 }
 
 func (s *SQLiteStore) Read(streamID string, fromSeq int64) ([]Event, error) {
@@ -267,6 +536,18 @@ type appendResult struct {
 	err    error
 }
 
+type forkJob struct {
+	parentStreamID string
+	forkFromSeq    int64
+	newQuery       string
+	result         chan forkResult
+}
+
+type forkResult struct {
+	streamID string
+	err      error
+}
+
 func (s *SQLiteStore) execAppend(job *appendJob) ([]Event, error) {
 	tx, err := s.db.BeginTx(context.Background(), &sql.TxOptions{})
 	if err != nil {
@@ -343,4 +624,74 @@ func nullString(value string) sql.NullString {
 		return sql.NullString{}
 	}
 	return sql.NullString{String: value, Valid: true}
+}
+
+func parseSQLiteTime(value string) time.Time {
+	if value == "" {
+		return time.Time{}
+	}
+	if parsed, err := time.Parse(time.RFC3339, value); err == nil {
+		return parsed
+	}
+	if parsed, err := time.Parse("2006-01-02 15:04:05", value); err == nil {
+		return parsed
+	}
+	return time.Time{}
+}
+
+func (s *SQLiteStore) execFork(job *forkJob) (string, error) {
+	if job.parentStreamID == "" {
+		return "", fmt.Errorf("parent_stream_id is required")
+	}
+	if job.forkFromSeq <= 0 {
+		return "", fmt.Errorf("fork_from_seq must be positive")
+	}
+	newStreamID := fmt.Sprintf("%s/fork:%d", job.parentStreamID, job.forkFromSeq)
+	tx, err := s.db.BeginTx(context.Background(), &sql.TxOptions{})
+	if err != nil {
+		return "", err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	res, err := tx.Exec(`
+		INSERT INTO event_log(stream_id, stream_seq, event_type, payload, parent_id, timestamp)
+		SELECT ?, stream_seq, event_type, payload, ?, timestamp
+		FROM event_log
+		WHERE stream_id = ? AND stream_seq <= ?
+		ORDER BY stream_seq ASC
+	`, newStreamID, job.parentStreamID, job.parentStreamID, job.forkFromSeq)
+	if err != nil {
+		return "", err
+	}
+	rows, _ := res.RowsAffected()
+	if rows != job.forkFromSeq {
+		return "", fmt.Errorf("fork source has %d events through seq %d", rows, job.forkFromSeq)
+	}
+	payload, err := json.Marshal(map[string]any{
+		"forked_from": job.parentStreamID,
+		"fork_at_seq": job.forkFromSeq,
+		"new_query":   job.newQuery,
+	})
+	if err != nil {
+		return "", err
+	}
+	if _, err := tx.Exec(
+		"INSERT INTO event_log(stream_id, stream_seq, event_type, payload, parent_id) VALUES(?,?,?,?,?)",
+		newStreamID,
+		job.forkFromSeq+1,
+		"ForkCreated",
+		string(payload),
+		job.parentStreamID,
+	); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	committed = true
+	return newStreamID, nil
 }

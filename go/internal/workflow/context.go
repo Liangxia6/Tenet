@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/tenet/orchestrator/internal/config"
 	"github.com/tenet/orchestrator/internal/storage"
@@ -23,11 +24,13 @@ type WorkflowContext struct {
 	store           storage.Store
 	streamID        string
 	parentID        string
+	mode            ContextMode
 	history         []storage.Event
 	historyPos      int
 	pendingRecords  []storage.AppendEvent
 	recordBatchSize int
 	config          *config.RuntimeConfig
+	versionMarkers  map[string]bool
 	mu              sync.Mutex
 }
 
@@ -61,9 +64,11 @@ func NewContext(
 		store:           store,
 		streamID:        streamID,
 		parentID:        parentID,
+		mode:            mode,
 		history:         history,
 		recordBatchSize: recordBatchSize,
 		config:          cfg,
+		versionMarkers:  map[string]bool{},
 	}, nil
 }
 
@@ -143,6 +148,99 @@ func (c *WorkflowContext) Commit(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.flushLocked(ctx)
+}
+
+func (c *WorkflowContext) Suspend(ctx context.Context, reason string) error {
+	if reason == "" {
+		reason = "workflow suspended"
+	}
+	if err := c.Record(ctx, "TaskPaused", map[string]any{"reason": reason}); err != nil {
+		return err
+	}
+	return c.Commit(ctx)
+}
+
+func (c *WorkflowContext) Sleep(ctx context.Context, timerID string, delay time.Duration) error {
+	if timerID == "" {
+		return fmt.Errorf("timer_id is required")
+	}
+	if delay < 0 {
+		return fmt.Errorf("delay must be non-negative")
+	}
+	delayMS := delay.Milliseconds()
+	if err := c.Record(ctx, "TimerScheduled", map[string]any{
+		"timer_id": timerID,
+		"delay_ms": delayMS,
+	}); err != nil {
+		return err
+	}
+	if c.mode == ContextModeReplay {
+		return c.Record(ctx, "TimerFired", map[string]any{"timer_id": timerID, "delay_ms": delayMS})
+	}
+	if err := c.Commit(ctx); err != nil {
+		return err
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return c.Record(ctx, "TimerFired", map[string]any{"timer_id": timerID, "delay_ms": delayMS})
+}
+
+func (c *WorkflowContext) GetVersion(changeID string, minVersion int) int {
+	if changeID == "" {
+		return 1
+	}
+	if minVersion <= 0 {
+		minVersion = 1
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.versionMarkers[changeID] {
+		return minVersion
+	}
+	for i, evt := range c.history {
+		if evt.EventType != "VersionMarker" {
+			continue
+		}
+		var payload struct {
+			ChangeID string `json:"change_id"`
+			Version  int    `json:"version"`
+		}
+		if err := json.Unmarshal([]byte(evt.Payload), &payload); err != nil {
+			continue
+		}
+		if payload.ChangeID != changeID {
+			continue
+		}
+		c.history = append(c.history[:i], c.history[i+1:]...)
+		if i < c.historyPos {
+			c.historyPos--
+		}
+		c.versionMarkers[changeID] = true
+		if payload.Version <= 0 {
+			return 1
+		}
+		return payload.Version
+	}
+	if c.historyPos < len(c.history) {
+		c.versionMarkers[changeID] = true
+		return 1
+	}
+	c.pendingRecords = append(c.pendingRecords, storage.AppendEvent{
+		StreamID:  c.streamID,
+		EventType: "VersionMarker",
+		Payload: map[string]any{
+			"change_id": changeID,
+			"version":   minVersion,
+		},
+		ParentID: c.parentID,
+	})
+	c.versionMarkers[changeID] = true
+	return minVersion
 }
 
 func (c *WorkflowContext) HistoryPosition() int {

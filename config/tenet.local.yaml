@@ -1,0 +1,108 @@
+database:
+  path: data/tenet.db
+  max_open_conns: 1
+  busy_timeout_ms: 5000
+  write_queue_size: 1024
+  wal_mode: true
+
+redis:
+  addr: 127.0.0.1:6379
+  password: ""
+  db: 0
+  session_lock_ttl_seconds: 30
+  session_heartbeat_seconds: 10
+
+scheduler:
+  queue_size: 100
+
+grpc:
+  orchestrator_port: 50051
+  worker_port: 50052
+  control_timeout_seconds: 60
+  execute_timeout_seconds: 300
+  retry_max_attempts: 3
+  retry_backoff_base_ms: 250
+  circuit_breaker_threshold: 5
+  circuit_breaker_timeout_seconds: 30
+
+workflow:
+  max_concurrent_tasks: 4
+  default_strategy: auto
+  complexity_threshold_dag: 0.3
+  snapshot_event_interval: 50
+  snapshot_time_interval_seconds: 300
+  record_batch_size: 20
+
+workspace:
+  base_path: workspaces
+  snapshot_driver: auto
+  exclude_patterns:
+    - node_modules
+    - .venv
+    - dist
+    - build
+  backup_enabled: true
+  backup_retention_count: 3
+  cleanup_on_session_end: false
+
+skills:
+  skills_path: config/skills
+  skills_auto_discover: true
+
+agent:
+  default_max_steps: 50
+  default_temperature: 0.7
+  convergence_no_tool_calls: 1
+  loop_detection_repeat_threshold: 3
+  default_token_budget: 100000
+
+safety:
+  require_approval: []
+  max_auto_fix_retries: 3
+  shell_dangerous_patterns:
+    - "rm -rf /"
+    - "mkfs"
+    - ":(){"
+
+interactive:
+  human_timeout_seconds: 0
+  inject_prefix: "[Human Feedback]\n"
+
+rate_limits:
+  shell:
+    max_per_minute: 30
+    max_per_second: 5
+  web_search:
+    max_per_minute: 10
+  write_file:
+    max_per_second: 20
+  llm_call:
+    max_per_minute: 60
+
+llm_providers:
+  - name: deepseek
+    adapter: openai
+    base_url: https://api.deepseek.com/v1
+    api_key: ""
+    default_model: deepseek-chat
+    models: [deepseek-chat]
+    max_concurrency: 3
+    timeout_seconds: 120
+  - name: openai
+    adapter: openai
+    base_url: https://api.openai.com/v1
+    api_key: ""
+    default_model: gpt-4o-mini
+    models: [gpt-4o-mini]
+    max_concurrency: 3
+    timeout_seconds: 120
+
+coding:
+  static_check_cmd: ""
+  test_cmd: ""
+  auto_fix_max_retries: 1
+
+logging:
+  level: info
+  format: text
+  output: stdout
