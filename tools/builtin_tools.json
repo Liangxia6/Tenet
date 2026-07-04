@@ -1,0 +1,87 @@
+[
+  {
+    "name": "read_file",
+    "description": "Read a file inside the workspace. Arguments: path, optional offset line number, optional limit line count.",
+    "parameters_schema": "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"offset\":{\"type\":\"integer\",\"minimum\":1},\"limit\":{\"type\":\"integer\",\"minimum\":1}},\"required\":[\"path\"]}"
+  },
+  {
+    "name": "write_file",
+    "description": "Overwrite a file inside the workspace, creating parent directories. Arguments: path, content.",
+    "parameters_schema": "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}"
+  },
+  {
+    "name": "append_file",
+    "description": "Append content to a workspace file, creating parent directories. Arguments: path, content.",
+    "parameters_schema": "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}"
+  },
+  {
+    "name": "replace_in_file",
+    "description": "Replace text in a workspace file. Arguments: path, old, new, optional count.",
+    "parameters_schema": "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"old\":{\"type\":\"string\"},\"new\":{\"type\":\"string\"},\"count\":{\"type\":\"integer\",\"minimum\":1}},\"required\":[\"path\",\"old\",\"new\"]}"
+  },
+  {
+    "name": "list_dir",
+    "description": "List files and directories inside the workspace. Arguments: optional path, recursive, max_entries.",
+    "parameters_schema": "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"recursive\":{\"type\":\"boolean\"},\"max_entries\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1000}}}"
+  },
+  {
+    "name": "search_files",
+    "description": "Find workspace files by name substring or glob. Arguments: query, optional path, max_results.",
+    "parameters_schema": "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"max_results\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1000}},\"required\":[\"query\"]}"
+  },
+  {
+    "name": "grep",
+    "description": "Search text within workspace files. Arguments: query, optional path, case_sensitive, max_matches.",
+    "parameters_schema": "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"case_sensitive\":{\"type\":\"boolean\"},\"max_matches\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1000}},\"required\":[\"query\"]}"
+  },
+  {
+    "name": "file_info",
+    "description": "Return metadata for a workspace file or directory. Arguments: path.",
+    "parameters_schema": "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}},\"required\":[\"path\"]}"
+  },
+  {
+    "name": "shell",
+    "description": "Run a shell command inside the workspace. Arguments: command, optional timeout_seconds.",
+    "parameters_schema": "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"timeout_seconds\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":600}},\"required\":[\"command\"]}"
+  },
+  {
+    "name": "git_status",
+    "description": "Return git status --short inside the workspace.",
+    "parameters_schema": "{\"type\":\"object\",\"properties\":{}}"
+  },
+  {
+    "name": "git_diff",
+    "description": "Return git diff inside the workspace. Arguments: optional path, max_bytes.",
+    "parameters_schema": "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"max_bytes\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":200000}}}"
+  },
+  {
+    "name": "apply_patch",
+    "description": "Apply a unified diff patch inside the workspace. Arguments: patch, optional strip.",
+    "parameters_schema": "{\"type\":\"object\",\"properties\":{\"patch\":{\"type\":\"string\"},\"strip\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":10}},\"required\":[\"patch\"]}"
+  },
+  {
+    "name": "git_log",
+    "description": "Return recent git commits. Arguments: optional limit, path, max_bytes.",
+    "parameters_schema": "{\"type\":\"object\",\"properties\":{\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100},\"path\":{\"type\":\"string\"},\"max_bytes\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":200000}}}"
+  },
+  {
+    "name": "git_show",
+    "description": "Show a git revision or object. Arguments: rev, optional max_bytes.",
+    "parameters_schema": "{\"type\":\"object\",\"properties\":{\"rev\":{\"type\":\"string\"},\"max_bytes\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":200000}},\"required\":[\"rev\"]}"
+  },
+  {
+    "name": "git_branch",
+    "description": "Return git branch information. Arguments: optional all.",
+    "parameters_schema": "{\"type\":\"object\",\"properties\":{\"all\":{\"type\":\"boolean\"}}}"
+  },
+  {
+    "name": "http_fetch",
+    "description": "Fetch a URL with GET and return status, content type, and body preview. Arguments: url, optional max_bytes.",
+    "parameters_schema": "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"},\"max_bytes\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":200000}},\"required\":[\"url\"]}"
+  },
+  {
+    "name": "web_search",
+    "description": "Search the web. Current local MVP returns a TODO stub unless a remote worker implements it.",
+    "parameters_schema": "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":10}},\"required\":[\"query\"]}"
+  }
+]

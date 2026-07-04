@@ -12,12 +12,16 @@ type LocalAgentClient struct {
 }
 
 func NewLocalAgentClient(generator Client, workspace string, dangerousPatterns []string) *LocalAgentClient {
+	return NewLocalAgentClientWithAllowlist(generator, workspace, dangerousPatterns, nil)
+}
+
+func NewLocalAgentClientWithAllowlist(generator Client, workspace string, dangerousPatterns []string, toolAllowlist []string) *LocalAgentClient {
 	if generator == nil {
 		generator = NewEchoClient()
 	}
 	return &LocalAgentClient{
 		Generator: generator,
-		Tools:     NewLocalToolExecutor(workspace, dangerousPatterns),
+		Tools:     NewLocalToolExecutorWithAllowlist(workspace, dangerousPatterns, toolAllowlist),
 		StartedAt: time.Now(),
 	}
 }

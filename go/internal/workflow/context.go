@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -10,6 +11,24 @@ import (
 	"github.com/tenet/orchestrator/internal/config"
 	"github.com/tenet/orchestrator/internal/storage"
 )
+
+var ErrWorkflowSuspended = errors.New("workflow suspended")
+
+type SuspensionError struct {
+	Reason  string
+	TimerID string
+}
+
+func (e SuspensionError) Error() string {
+	if e.TimerID != "" {
+		return fmt.Sprintf("%s: %s", e.Reason, e.TimerID)
+	}
+	return e.Reason
+}
+
+func (e SuspensionError) Unwrap() error {
+	return ErrWorkflowSuspended
+}
 
 type ContextMode string
 
@@ -87,6 +106,9 @@ func (c *WorkflowContext) Record(ctx context.Context, eventType string, payload 
 		c.historyPos++
 		return nil
 	}
+	if c.mode == ContextModeReplay {
+		return fmt.Errorf("non-determinism detected: at stream=%s, pos=%d, expected=%s, got=end-of-history", c.streamID, c.historyPos, eventType)
+	}
 
 	c.pendingRecords = append(c.pendingRecords, storage.AppendEvent{
 		StreamID:  c.streamID,
@@ -119,6 +141,10 @@ func (c *WorkflowContext) Decide(ctx context.Context, decisionType string, fn De
 			return nil, fmt.Errorf("decode decision payload: %w", err)
 		}
 		return payload.Result, nil
+	}
+	if c.mode == ContextModeReplay {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("non-determinism detected: at stream=%s, pos=%d, expected=%s, got=end-of-history", c.streamID, c.historyPos, decisionType)
 	}
 	c.mu.Unlock()
 
@@ -171,23 +197,20 @@ func (c *WorkflowContext) Sleep(ctx context.Context, timerID string, delay time.
 	if err := c.Record(ctx, "TimerScheduled", map[string]any{
 		"timer_id": timerID,
 		"delay_ms": delayMS,
+		"due_at":   time.Now().UTC().Add(delay).Format(time.RFC3339Nano),
 	}); err != nil {
 		return err
 	}
 	if c.mode == ContextModeReplay {
-		return c.Record(ctx, "TimerFired", map[string]any{"timer_id": timerID, "delay_ms": delayMS})
+		if c.nextHistoryEventType() == "TimerFired" {
+			return c.Record(ctx, "TimerFired", map[string]any{"timer_id": timerID, "delay_ms": delayMS})
+		}
+		return SuspensionError{Reason: "timer scheduled", TimerID: timerID}
 	}
 	if err := c.Commit(ctx); err != nil {
 		return err
 	}
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-	return c.Record(ctx, "TimerFired", map[string]any{"timer_id": timerID, "delay_ms": delayMS})
+	return SuspensionError{Reason: "timer scheduled", TimerID: timerID}
 }
 
 func (c *WorkflowContext) GetVersion(changeID string, minVersion int) int {
@@ -230,6 +253,10 @@ func (c *WorkflowContext) GetVersion(changeID string, minVersion int) int {
 		c.versionMarkers[changeID] = true
 		return 1
 	}
+	if c.mode == ContextModeReplay {
+		c.versionMarkers[changeID] = true
+		return 1
+	}
 	c.pendingRecords = append(c.pendingRecords, storage.AppendEvent{
 		StreamID:  c.streamID,
 		EventType: "VersionMarker",
@@ -255,9 +282,21 @@ func (c *WorkflowContext) HistoryLength() int {
 	return len(c.history)
 }
 
+func (c *WorkflowContext) nextHistoryEventType() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.historyPos >= len(c.history) {
+		return ""
+	}
+	return c.history[c.historyPos].EventType
+}
+
 func (c *WorkflowContext) flushLocked(ctx context.Context) error {
 	if len(c.pendingRecords) == 0 {
 		return nil
+	}
+	if c.mode == ContextModeReplay {
+		return fmt.Errorf("non-determinism detected: replay attempted to append %d event(s)", len(c.pendingRecords))
 	}
 	appended, err := c.store.AppendEvents(ctx, c.pendingRecords)
 	if err != nil {

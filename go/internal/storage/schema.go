@@ -5,6 +5,8 @@ import (
 	"fmt"
 )
 
+const CurrentSchemaVersion = 1
+
 func InitSchema(db *sql.DB) error {
 	statements := []string{
 		"PRAGMA journal_mode=WAL",
@@ -63,6 +65,22 @@ func InitSchema(db *sql.DB) error {
 			version INTEGER PRIMARY KEY,
 			applied_at TEXT NOT NULL DEFAULT (datetime('now'))
 		)`,
+		`CREATE TABLE IF NOT EXISTS memory_entries (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			stream_id TEXT NOT NULL,
+			turn_id TEXT,
+			run_id TEXT,
+			kind TEXT NOT NULL,
+			content TEXT NOT NULL,
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		)`,
+		`CREATE VIRTUAL TABLE IF NOT EXISTS memory_entries_fts USING fts5(
+			content,
+			kind UNINDEXED,
+			stream_id UNINDEXED,
+			content='memory_entries',
+			content_rowid='id'
+		)`,
 		"CREATE INDEX IF NOT EXISTS idx_event_log_stream_id ON event_log(stream_id)",
 		"CREATE INDEX IF NOT EXISTS idx_event_log_stream_id_seq ON event_log(stream_id, stream_seq)",
 		"CREATE INDEX IF NOT EXISTS idx_event_log_type ON event_log(event_type)",
@@ -73,11 +91,32 @@ func InitSchema(db *sql.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_snapshots_stream_id_seq ON snapshots(stream_id, stream_seq DESC)",
 		"CREATE INDEX IF NOT EXISTS idx_projection_snapshots_seq ON projection_snapshots(stream_id, stream_seq DESC)",
 		"CREATE INDEX IF NOT EXISTS idx_token_telemetry_task ON token_telemetry(task_id)",
+		"CREATE INDEX IF NOT EXISTS idx_memory_entries_stream ON memory_entries(stream_id, created_at DESC)",
 	}
 	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {
 			return fmt.Errorf("init schema: %w", err)
 		}
 	}
+	if _, err := db.Exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)", CurrentSchemaVersion); err != nil {
+		return fmt.Errorf("record schema migration: %w", err)
+	}
 	return nil
+}
+
+func AppliedSchemaVersions(db *sql.DB) ([]int, error) {
+	rows, err := db.Query("SELECT version FROM schema_migrations ORDER BY version ASC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var versions []int
+	for rows.Next() {
+		var version int
+		if err := rows.Scan(&version); err != nil {
+			return nil, err
+		}
+		versions = append(versions, version)
+	}
+	return versions, rows.Err()
 }

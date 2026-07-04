@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -161,21 +162,25 @@ func TestSleepRecordsTimerAndReplayDoesNotWait(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new context: %v", err)
 	}
-	if err := wfctx.Sleep(ctx, "short", 5*time.Millisecond); err != nil {
-		t.Fatalf("sleep: %v", err)
+	start := time.Now()
+	if err := wfctx.Sleep(ctx, "short", time.Hour); !errors.Is(err, ErrWorkflowSuspended) {
+		t.Fatalf("sleep err = %v, want suspended", err)
+	}
+	if time.Since(start) > 50*time.Millisecond {
+		t.Fatalf("durable sleep waited too long")
 	}
 	if err := wfctx.Commit(ctx); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	assertWorkflowEvents(t, store, "task:timer", "TimerScheduled", "TimerFired")
+	assertWorkflowEvents(t, store, "task:timer", "TimerScheduled")
 
 	replay, err := NewContext(ctx, store, "task:timer", "", ContextModeReplay, testConfig())
 	if err != nil {
 		t.Fatalf("new replay: %v", err)
 	}
-	start := time.Now()
-	if err := replay.Sleep(ctx, "short", time.Hour); err != nil {
-		t.Fatalf("replay sleep: %v", err)
+	start = time.Now()
+	if err := replay.Sleep(ctx, "short", time.Hour); !errors.Is(err, ErrWorkflowSuspended) {
+		t.Fatalf("replay sleep err = %v, want suspended", err)
 	}
 	if time.Since(start) > 50*time.Millisecond {
 		t.Fatalf("replay sleep waited too long")

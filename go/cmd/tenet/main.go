@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -20,6 +21,7 @@ import (
 	"github.com/tenet/orchestrator/internal/guard"
 	"github.com/tenet/orchestrator/internal/projection"
 	"github.com/tenet/orchestrator/internal/scheduler"
+	"github.com/tenet/orchestrator/internal/skills"
 	"github.com/tenet/orchestrator/internal/storage"
 	timerpkg "github.com/tenet/orchestrator/internal/timer"
 	"github.com/tenet/orchestrator/internal/worker"
@@ -49,6 +51,8 @@ func run(args []string) error {
 		return serve(args[1:])
 	case "config":
 		return configCmd(args[1:])
+	case "skills":
+		return skillsCmd(args[1:])
 	case "task":
 		return taskCmd(args[1:])
 	case "workspace":
@@ -109,6 +113,8 @@ func serve(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+	stopTimerScanner := startDueTimerScanner(ctx, store, time.Second)
+	defer stopTimerScanner()
 	fmt.Printf("tenet ready: orchestrator=%s worker=:%d http=:%d database=%s\n", listener.Addr().String(), cfg.GRPC.WorkerPort, *httpPort, cfg.Database.Path)
 	select {
 	case <-ctx.Done():
@@ -124,73 +130,34 @@ func serve(args []string) error {
 	}
 }
 
-func newHTTPServer(addr string, store storage.Store, cfg *config.RuntimeConfig) *http.Server {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "version": version})
-	})
-	mux.HandleFunc("/tasks", func(w http.ResponseWriter, r *http.Request) {
-		limit := 20
-		streams, err := store.ListStreams(limit)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		engine := projection.NewEngine(store, cfg)
-		items := make([]map[string]any, 0, len(streams))
-		for _, stream := range streams {
-			view, _ := engine.ProjectTask(stream.StreamID)
-			items = append(items, map[string]any{
-				"stream_id":  stream.StreamID,
-				"status":     view.Status,
-				"latest_seq": stream.LatestSeq,
-				"last_event": stream.EventType,
-				"query":      view.Query,
-			})
-		}
-		_ = json.NewEncoder(w).Encode(items)
-	})
-	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
-		streamID := r.URL.Query().Get("stream_id")
-		if streamID == "" {
-			http.Error(w, "stream_id is required", http.StatusBadRequest)
-			return
-		}
-		fromSeq := int64(1)
-		if raw := r.URL.Query().Get("from"); raw != "" {
-			_, _ = fmt.Sscanf(raw, "%d", &fromSeq)
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		flusher, _ := w.(http.Flusher)
-		nextSeq := fromSeq
-		ticker := time.NewTicker(500 * time.Millisecond)
+func startDueTimerScanner(ctx context.Context, store storage.Store, interval time.Duration) func() {
+	if interval <= 0 {
+		interval = time.Second
+	}
+	scanCtx, cancel := context.WithCancel(ctx)
+	service := timerpkg.NewService(store)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
-			events, err := store.Read(streamID, nextSeq)
-			if err != nil {
-				fmt.Fprintf(w, "event: error\ndata: %q\n\n", err.Error())
-				if flusher != nil {
-					flusher.Flush()
-				}
-				return
-			}
-			for _, evt := range events {
-				data, _ := json.Marshal(eventrouter.FromStorageEvent(evt))
-				fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evt.EventType, data)
-				nextSeq = evt.StreamSeq + 1
-			}
-			if flusher != nil {
-				flusher.Flush()
-			}
 			select {
-			case <-r.Context().Done():
+			case <-scanCtx.Done():
 				return
 			case <-ticker.C:
+				_, _ = service.ResumeDueTimers(scanCtx, time.Now().UTC(), 1000)
 			}
 		}
-	})
-	return &http.Server{Addr: addr, Handler: mux}
+	}()
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+func newHTTPServer(addr string, store storage.Store, cfg *config.RuntimeConfig) *http.Server {
+	return &http.Server{Addr: addr, Handler: withCORS(newAPIHandler(store, cfg))}
 }
 
 func configCmd(args []string) error {
@@ -240,6 +207,56 @@ func configCmd(args []string) error {
 		return nil
 	default:
 		return fmt.Errorf("unknown config subcommand %q", args[0])
+	}
+}
+
+func skillsCmd(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("missing skills subcommand")
+	}
+	switch args[0] {
+	case "list":
+		fs := flag.NewFlagSet("skills list", flag.ContinueOnError)
+		configPath := fs.String("config", "config/tenet.yaml", "path to configuration file")
+		output := fs.String("output", "text", "output format: text/json")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		cfg, err := loadConfig(*configPath, true)
+		if err != nil {
+			return err
+		}
+		registry, err := skills.Discover(cfg)
+		if err != nil {
+			return err
+		}
+		if *output == "json" {
+			return json.NewEncoder(os.Stdout).Encode(map[string]any{
+				"skills":      registry.Skills,
+				"tools":       registry.ToolDefinitions(),
+				"mcp_servers": registry.MCPServers(),
+			})
+		}
+		fmt.Printf("skills: %d\n", len(registry.Skills))
+		for _, skill := range registry.Skills {
+			fmt.Printf("- %s", skill.Name)
+			if skill.Version != "" {
+				fmt.Printf(" (%s)", skill.Version)
+			}
+			if skill.Description != "" {
+				fmt.Printf(": %s", skill.Description)
+			}
+			fmt.Println()
+			for _, tool := range skill.Tools {
+				fmt.Printf("  tool: %s\n", tool.Name)
+			}
+			for _, server := range skill.MCPServers {
+				fmt.Printf("  mcp:  %s -> %s\n", server.Name, server.Command)
+			}
+		}
+		return nil
+	default:
+		return fmt.Errorf("unknown skills subcommand %q", args[0])
 	}
 }
 
@@ -536,6 +553,8 @@ func taskRun(args []string) error {
 	defer store.Close()
 
 	streamID := "task:" + newID()
+	turnID := "turn:" + newID()
+	runID := "run:" + newID()
 	route := workflow.Route(query, *workflowName)
 	workspaceAbs, _ := filepath.Abs(*workspacePath)
 	client, taskModel, err := buildTaskClient(*workerMode, *model, *baseURL, *apiKeyEnv, *workerAddress, workspaceAbs, cfg)
@@ -548,7 +567,21 @@ func taskRun(args []string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.GRPC.ExecuteTimeoutSeconds)*time.Second)
 	defer cancel()
 	if _, err := store.AppendEvents(ctx, []storage.AppendEvent{
+		{StreamID: streamID, EventType: "SessionCreated", Payload: map[string]any{
+			"session_id":    streamID,
+			"query":         query,
+			"workspace":     workspaceAbs,
+			"workflow_type": route.Workflow,
+		}},
+		{StreamID: streamID, EventType: "TurnCreated", Payload: map[string]any{
+			"session_id": streamID,
+			"turn_id":    turnID,
+			"query":      query,
+		}},
 		{StreamID: streamID, EventType: "TaskCreated", Payload: map[string]any{
+			"session_id":    streamID,
+			"turn_id":       turnID,
+			"run_id":        runID,
 			"query":         query,
 			"workspace":     workspaceAbs,
 			"workflow_type": route.Workflow,
@@ -557,6 +590,9 @@ func taskRun(args []string) error {
 			"complexity_score":  route.ComplexityScore,
 			"reason":            route.Reason,
 			"selected_workflow": route.Workflow,
+			"task_type":         route.TaskType,
+			"required_tools":    route.RequiredTools,
+			"risk_level":        route.RiskLevel,
 		}},
 	}); err != nil {
 		return err
@@ -566,12 +602,14 @@ func taskRun(args []string) error {
 		Mode:         workflow.ContextModeExecution,
 		WorkflowType: route.Workflow,
 		SessionID:    streamID,
+		TurnID:       turnID,
+		RunID:        runID,
 		Query:        query,
 		Workspace:    workspaceAbs,
 		SystemPrompt: defaultAgentSystemPrompt(workspaceAbs),
 		Model:        taskModel,
 		AgentRole:    "default",
-		Tools:        worker.BuiltinToolDefinitions(),
+		Tools:        worker.BuiltinToolDefinitionsWithAllowlist(cfg.Safety.ToolAllowlist),
 		Config:       cfg,
 		Client:       client,
 	}
@@ -583,6 +621,23 @@ func taskRun(args []string) error {
 		result, runErr = workflow.Execute(ctx, store, workflow.NewRegistry(), task)
 	}
 	if runErr != nil {
+		if errors.Is(runErr, workflow.ErrWorkflowSuspended) {
+			out := map[string]any{
+				"task_id":          streamID,
+				"status":           "PAUSED",
+				"workflow":         task.WorkflowType,
+				"complexity_score": route.ComplexityScore,
+				"error":            runErr.Error(),
+			}
+			if *output == "json" {
+				return json.NewEncoder(os.Stdout).Encode(out)
+			}
+			fmt.Printf("task_id:    %s\n", streamID)
+			fmt.Printf("status:     PAUSED\n")
+			fmt.Printf("workflow:   %s (%s)\n", task.WorkflowType, route.Reason)
+			fmt.Printf("reason:     %v\n", runErr)
+			return nil
+		}
 		return runErr
 	}
 	out := map[string]any{
@@ -620,16 +675,23 @@ func executeScheduled(ctx context.Context, store storage.Store, cfg *config.Runt
 }
 
 func buildTaskClient(mode, model, baseURL, apiKeyEnv, workerAddress, workspace string, cfg *config.RuntimeConfig) (worker.Client, string, error) {
+	return buildTaskClientWithKey(mode, model, baseURL, apiKeyEnv, "", workerAddress, workspace, cfg)
+}
+
+func buildTaskClientWithKey(mode, model, baseURL, apiKeyEnv, directAPIKey, workerAddress, workspace string, cfg *config.RuntimeConfig) (worker.Client, string, error) {
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	if mode == "" {
 		mode = "echo"
 	}
 	switch mode {
 	case "echo":
-		return worker.NewLocalAgentClient(worker.NewEchoClient(), workspace, cfg.Safety.ShellDangerousPatterns), model, nil
+		return worker.NewLocalAgentClientWithAllowlist(worker.NewEchoClient(), workspace, cfg.Safety.ShellDangerousPatterns, cfg.Safety.ToolAllowlist), model, nil
 	case "openai":
 		provider := findLLMProvider(cfg, "openai")
 		resolvedBaseURL, apiKey, resolvedModel := resolveLLMOptions(provider, model, baseURL, apiKeyEnv, "OPENAI_API_KEY", worker.DefaultOpenAIModel)
+		if strings.TrimSpace(directAPIKey) != "" {
+			apiKey = strings.TrimSpace(directAPIKey)
+		}
 		if apiKey == "" {
 			return nil, "", fmt.Errorf("--worker openai requires %s or an llm_providers api_key", defaultEnvName(apiKeyEnv, "OPENAI_API_KEY"))
 		}
@@ -641,10 +703,13 @@ func buildTaskClient(mode, model, baseURL, apiKeyEnv, workerAddress, workspace s
 		if err != nil {
 			return nil, "", err
 		}
-		return worker.NewLocalAgentClient(generator, workspace, cfg.Safety.ShellDangerousPatterns), resolvedModel, nil
+		return worker.NewLocalAgentClientWithAllowlist(generator, workspace, cfg.Safety.ShellDangerousPatterns, cfg.Safety.ToolAllowlist), resolvedModel, nil
 	case "deepseek":
 		provider := findLLMProvider(cfg, "deepseek")
 		resolvedBaseURL, apiKey, resolvedModel := resolveLLMOptions(provider, model, baseURL, apiKeyEnv, "DEEPSEEK_API_KEY", worker.DefaultDeepSeekModel)
+		if strings.TrimSpace(directAPIKey) != "" {
+			apiKey = strings.TrimSpace(directAPIKey)
+		}
 		if apiKey == "" {
 			return nil, "", fmt.Errorf("--worker deepseek requires %s or a deepseek llm_providers api_key", defaultEnvName(apiKeyEnv, "DEEPSEEK_API_KEY"))
 		}
@@ -656,7 +721,7 @@ func buildTaskClient(mode, model, baseURL, apiKeyEnv, workerAddress, workspace s
 		if err != nil {
 			return nil, "", err
 		}
-		return worker.NewLocalAgentClient(generator, workspace, cfg.Safety.ShellDangerousPatterns), resolvedModel, nil
+		return worker.NewLocalAgentClientWithAllowlist(generator, workspace, cfg.Safety.ShellDangerousPatterns, cfg.Safety.ToolAllowlist), resolvedModel, nil
 	case "grpc":
 		address := strings.TrimSpace(workerAddress)
 		if address == "" {
@@ -775,6 +840,8 @@ func taskReplay(args []string) error {
 	fs := flag.NewFlagSet("task replay", flag.ContinueOnError)
 	configPath := fs.String("config", "config/tenet.yaml", "path to configuration file")
 	streamID := fs.String("stream", "", "stream id")
+	runID := fs.String("run", "", "optional run id; defaults to latest run in the stream")
+	output := fs.String("output", "text", "output format: text/json")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -790,15 +857,38 @@ func taskReplay(args []string) error {
 		return err
 	}
 	defer store.Close()
-	events, err := store.Read(*streamID, 1)
+	result, err := workflow.Replay(context.Background(), store, workflow.NewRegistry(), &workflow.TaskHandle{
+		StreamID: *streamID,
+		RunID:    *runID,
+		Config:   cfg,
+	})
 	if err != nil {
 		return err
 	}
-	fmt.Printf("Replaying %s (%d events)\n", *streamID, len(events))
-	for _, evt := range events {
-		fmt.Printf("  seq=%d\t%s\tok\n", evt.StreamSeq, evt.EventType)
+	if *output == "json" {
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"stream_id":       result.StreamID,
+			"session_id":      result.SessionID,
+			"turn_id":         result.TurnID,
+			"run_id":          result.RunID,
+			"workflow":        result.Workflow,
+			"events_replayed": result.EventsReplayed,
+			"latest_seq":      result.LatestSeq,
+			"result":          result.Result,
+			"deterministic":   true,
+		})
 	}
-	fmt.Println("Deterministic check: PASSED")
+	fmt.Printf("Replay %s\n", result.StreamID)
+	if result.RunID != "" {
+		fmt.Printf("run:        %s\n", result.RunID)
+	}
+	if result.TurnID != "" {
+		fmt.Printf("turn:       %s\n", result.TurnID)
+	}
+	fmt.Printf("workflow:   %s\n", result.Workflow)
+	fmt.Printf("events:     %d\n", result.EventsReplayed)
+	fmt.Printf("latest_seq: %d\n", result.LatestSeq)
+	fmt.Println("determinism: PASSED")
 	return nil
 }
 
@@ -1205,5 +1295,5 @@ func newID() string {
 }
 
 func printUsage() {
-	fmt.Println("usage: tenet <serve|task|config|version> [flags]")
+	fmt.Println("usage: tenet <serve|task|workspace|skills|config|version> [flags]")
 }

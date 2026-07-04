@@ -2,6 +2,8 @@ package workflow
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -109,13 +111,266 @@ func TestReactWorkflowExecutesLocalToolAndRecordsEvents(t *testing.T) {
 		t.Fatalf("read events: %v", err)
 	}
 	seen := map[string]bool{}
+	counts := map[string]int{}
 	for _, evt := range events {
 		seen[evt.EventType] = true
+		counts[evt.EventType]++
 	}
-	for _, want := range []string{"TaskStarted", "GenerateThought", "ToolExecuted", "TaskCompleted"} {
+	for _, want := range []string{"TaskStarted", "ContextAssembled", "LLMCallStarted", "GenerateThought", "LLMCallCompleted", "ToolCallStarted", "ToolExecuted", "ToolCallCompleted", "TaskCompleted"} {
 		if !seen[want] {
 			t.Fatalf("missing event %s in %+v", want, events)
 		}
+	}
+	if counts["ContextAssembled"] != 2 {
+		t.Fatalf("context counts = %+v", counts)
+	}
+	if counts["LLMCallStarted"] != 2 || counts["LLMCallCompleted"] != 2 {
+		t.Fatalf("llm call counts = %+v", counts)
+	}
+	if counts["ToolCallStarted"] != 1 || counts["ToolCallCompleted"] != 1 {
+		t.Fatalf("tool call counts = %+v", counts)
+	}
+}
+
+func TestReactWorkflowBlocksToolOutsideAllowlistBeforeClientCall(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	store := testStore(t)
+	defer store.Close()
+
+	client := &scriptedGenerator{
+		responses: []worker.GenerateThoughtResponse{{
+			Thought:      "Need shell.",
+			FinishReason: "tool_calls",
+			ToolCalls: []worker.ToolCall{{
+				CallID:    "call_shell",
+				ToolName:  "shell",
+				Arguments: `{"command":"pwd"}`,
+			}},
+		}},
+	}
+	cfg := config.Default()
+	cfg.Agent.DefaultMaxSteps = 2
+	cfg.Safety.ToolAllowlist = []string{"read_file"}
+
+	_, err := Execute(ctx, store, NewRegistry(), &TaskHandle{
+		StreamID:     "task:tool-allowlist",
+		WorkflowType: "react",
+		SessionID:    "task:tool-allowlist",
+		Query:        "Use shell",
+		Workspace:    t.TempDir(),
+		SystemPrompt: "Use tools.",
+		Tools:        worker.BuiltinToolDefinitionsWithAllowlist(cfg.Safety.ToolAllowlist),
+		Config:       cfg,
+		Client:       client,
+	})
+	if err == nil {
+		t.Fatalf("expected disallowed tool to fail")
+	}
+	if len(client.toolRequests) != 0 {
+		t.Fatalf("tool requests = %d, want 0", len(client.toolRequests))
+	}
+
+	events, readErr := store.Read("task:tool-allowlist", 1)
+	if readErr != nil {
+		t.Fatalf("read events: %v", readErr)
+	}
+	seenFailure := false
+	for _, evt := range events {
+		if evt.EventType != "ToolCallFailed" {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(evt.Payload), &payload); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		if payload["tool_name"] == "shell" && payload["error_code"] == "PERMISSION_DENIED" {
+			seenFailure = true
+		}
+	}
+	if !seenFailure {
+		t.Fatalf("missing ToolCallFailed PERMISSION_DENIED event in %+v", events)
+	}
+}
+
+func TestReactWorkflowRecordsTouchedFilesForMutatingTool(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	store := testStore(t)
+	defer store.Close()
+
+	workspace := t.TempDir()
+	generator := &scriptedGenerator{
+		responses: []worker.GenerateThoughtResponse{
+			{
+				Thought:      "Write a note.",
+				FinishReason: "tool_calls",
+				ToolCalls: []worker.ToolCall{{
+					CallID:    "call_write",
+					ToolName:  "write_file",
+					Arguments: `{"path":"notes.txt","content":"hello"}`,
+				}},
+			},
+			{
+				Thought:      "done",
+				IsFinal:      true,
+				FinishReason: "stop",
+			},
+		},
+	}
+	cfg := config.Default()
+	cfg.Agent.DefaultMaxSteps = 4
+
+	_, err := Execute(ctx, store, NewRegistry(), &TaskHandle{
+		StreamID:     "task:touched-files",
+		WorkflowType: "react",
+		SessionID:    "task:touched-files",
+		Query:        "Write a file",
+		Workspace:    workspace,
+		SystemPrompt: "Use tools.",
+		Tools:        worker.BuiltinToolDefinitions(),
+		Config:       cfg,
+		Client:       worker.NewLocalAgentClient(generator, workspace, nil),
+	})
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	events, err := store.Read("task:touched-files", 1)
+	if err != nil {
+		t.Fatalf("read events: %v", err)
+	}
+	for _, evt := range events {
+		if evt.EventType != "ToolCallCompleted" {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(evt.Payload), &payload); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		files, ok := payload["touched_files"].([]any)
+		if !ok || len(files) != 1 || files[0] != "notes.txt" {
+			t.Fatalf("touched_files = %#v, want [notes.txt]", payload["touched_files"])
+		}
+		return
+	}
+	t.Fatalf("missing ToolCallCompleted event in %+v", events)
+}
+
+func TestWorkflowEnforcesTokenBudget(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	store := testStore(t)
+	defer store.Close()
+
+	cfg := config.Default()
+	cfg.Agent.DefaultTokenBudget = 5
+	cfg.Workflow.RecordBatchSize = 20
+	_, err := Execute(ctx, store, NewRegistry(), &TaskHandle{
+		StreamID:     "task:budget",
+		WorkflowType: "simple",
+		Query:        "hello",
+		Workspace:    t.TempDir(),
+		SystemPrompt: "system",
+		Config:       cfg,
+		Client: worker.StaticClient{Response: worker.GenerateThoughtResponse{
+			Thought: "expensive answer",
+			IsFinal: true,
+			Usage:   worker.TokenUsage{PromptTokens: 4, CompletionTokens: 4, TotalTokens: 8},
+		}},
+	})
+	if err == nil {
+		t.Fatalf("expected token budget error")
+	}
+	if !strings.Contains(err.Error(), "token budget exceeded") {
+		t.Fatalf("error = %v", err)
+	}
+	events, err := store.Read("task:budget", 1)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, event := range events {
+		seen[event.EventType] = true
+	}
+	for _, want := range []string{"TokenUsed", "TokenBudgetExceeded", "TaskFailed", "RunFailed"} {
+		if !seen[want] {
+			t.Fatalf("missing %s in %+v", want, events)
+		}
+	}
+}
+
+func TestWorkflowCreatesWorkspaceCheckpointWhenConfigured(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	store := testStore(t)
+	defer store.Close()
+
+	workspace := t.TempDir()
+	if err := os.WriteFile(workspace+"/README.md", []byte("checkpoint me"), 0644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	cfg := config.Default()
+	cfg.Workspace.SnapshotDriver = "archive"
+	cfg.Workflow.RecordBatchSize = 20
+	if _, err := Execute(ctx, store, NewRegistry(), &TaskHandle{
+		StreamID:     "task:checkpoint",
+		WorkflowType: "simple",
+		SessionID:    "task:checkpoint",
+		Query:        "hello",
+		Workspace:    workspace,
+		SystemPrompt: "system",
+		Config:       cfg,
+		Client: worker.StaticClient{Response: worker.GenerateThoughtResponse{
+			Thought: "done",
+			IsFinal: true,
+			Usage:   worker.TokenUsage{TotalTokens: 1},
+		}},
+	}); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	events, err := store.Read("task:checkpoint", 1)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, event := range events {
+		seen[event.EventType] = true
+	}
+	for _, want := range []string{"WorkspaceSnapshot", "WorkspaceCheckpointCreated"} {
+		if !seen[want] {
+			t.Fatalf("missing %s in %+v", want, events)
+		}
+	}
+}
+
+func TestWorkflowCreatesSummaryMemoryEvents(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	store := testStore(t)
+	defer store.Close()
+	cfg := config.Default()
+	cfg.Workflow.RecordBatchSize = 20
+	if _, err := Execute(ctx, store, NewRegistry(), &TaskHandle{
+		StreamID:     "task:summary-memory",
+		WorkflowType: "simple",
+		SessionID:    "task:summary-memory",
+		Query:        "summarize memory",
+		Workspace:    t.TempDir(),
+		Config:       cfg,
+		Client:       worker.StaticClient{Response: worker.GenerateThoughtResponse{Thought: "memory answer", IsFinal: true}},
+	}); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	assertEvents(t, store, "task:summary-memory", "VersionMarker", "SessionSummaryCreated", "WorkspaceSummaryCreated")
+	if _, err := Replay(ctx, store, NewRegistry(), &TaskHandle{StreamID: "task:summary-memory", Config: cfg}); err != nil {
+		t.Fatalf("replay summary memory: %v", err)
+	}
+	memories, err := store.SearchMemory(ctx, "memory", 10)
+	if err != nil {
+		t.Fatalf("SearchMemory: %v", err)
+	}
+	if len(memories) == 0 {
+		t.Fatalf("expected memory entries")
 	}
 }
 
@@ -207,7 +462,34 @@ func TestDAGWorkflowDecomposesRunsSubtasksAndSummarizes(t *testing.T) {
 	if result.Result != "final dag answer" {
 		t.Fatalf("result = %v", result.Result)
 	}
-	assertEvents(t, store, "task:dag", "TaskDecomposed", "SubTaskDispatched", "SubTaskCompleted", "TaskCompleted")
+	assertEvents(t, store, "task:dag", "DAGExecutionStarted", "DAGWaveStarted", "DAGWaveCompleted", "DAGExecutionCompleted", "TaskDecomposed", "SubTaskDispatched", "SubTaskCompleted", "TaskCompleted")
+}
+
+func TestBuildDAGWavesGroupsReadySubtasks(t *testing.T) {
+	waves, err := buildDAGWaves([]dagSubtask{
+		{ID: "b", Task: "second independent"},
+		{ID: "a", Task: "first independent"},
+		{ID: "c", Task: "depends on both", DependsOn: []string{"a", "b"}},
+	})
+	if err != nil {
+		t.Fatalf("build waves: %v", err)
+	}
+	if len(waves) != 2 {
+		t.Fatalf("waves = %+v", waves)
+	}
+	if waves[0][0].ID != "a" || waves[0][1].ID != "b" || waves[1][0].ID != "c" {
+		t.Fatalf("waves = %+v", waves)
+	}
+}
+
+func TestBuildDAGWavesRejectsCycles(t *testing.T) {
+	_, err := buildDAGWaves([]dagSubtask{
+		{ID: "a", DependsOn: []string{"b"}},
+		{ID: "b", DependsOn: []string{"a"}},
+	})
+	if err == nil {
+		t.Fatalf("expected cycle error")
+	}
 }
 
 func TestScientificWorkflowRunsReasoningPatterns(t *testing.T) {
@@ -252,9 +534,11 @@ func TestCodingWorkflowRunsPhasesAndChecks(t *testing.T) {
 	store := testStore(t)
 	defer store.Close()
 	client := &scriptedGenerator{responses: []worker.GenerateThoughtResponse{
-		{Thought: "design", IsFinal: true},
-		{Thought: "coding", IsFinal: true},
+		{Thought: "inspect", IsFinal: true},
+		{Thought: "plan", IsFinal: true},
+		{Thought: "edit", IsFinal: true},
 		{Thought: "review", IsFinal: true},
+		{Thought: "summary", IsFinal: true},
 	}}
 	cfg := config.Default()
 	cfg.Coding.StaticCheckCmd = "printf static-ok"
@@ -271,10 +555,57 @@ func TestCodingWorkflowRunsPhasesAndChecks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("execute coding: %v", err)
 	}
-	if !strings.Contains(result.Result.(string), "Design:") {
+	if !strings.Contains(result.Result.(string), "Inspect:") || !strings.Contains(result.Result.(string), "Summary:") {
 		t.Fatalf("result = %v", result.Result)
 	}
 	assertEvents(t, store, "task:coding", "CodingPhaseStarted", "CodingPhaseCompleted", "CodingSnapshotCreated", "TaskCompleted")
+}
+
+func TestCodingWorkflowAutoFixesFailingTests(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	store := testStore(t)
+	defer store.Close()
+	client := &scriptedGenerator{responses: []worker.GenerateThoughtResponse{
+		{Thought: "inspect", IsFinal: true},
+		{Thought: "plan", IsFinal: true},
+		{Thought: "edit", IsFinal: true},
+		{Thought: "fix", IsFinal: true},
+		{Thought: "review", IsFinal: true},
+		{Thought: "summary", IsFinal: true},
+	}}
+	cfg := config.Default()
+	cfg.Coding.StaticCheckCmd = "printf static-ok"
+	cfg.Coding.TestCmd = "sh -c 'if [ ! -f fixed ]; then touch fixed; exit 1; fi; printf test-ok'"
+	cfg.Coding.AutoFixMaxRetries = 1
+	result, err := Execute(ctx, store, NewRegistry(), &TaskHandle{
+		StreamID:     "task:coding-fix",
+		WorkflowType: "coding",
+		SessionID:    "task:coding-fix",
+		Query:        "fix failing test",
+		Workspace:    t.TempDir(),
+		Config:       cfg,
+		Client:       client,
+	})
+	if err != nil {
+		t.Fatalf("execute coding: %v", err)
+	}
+	if !strings.Contains(result.Result.(string), "Fixes:") {
+		t.Fatalf("result = %v", result.Result)
+	}
+	events, err := store.Read("task:coding-fix", 1)
+	if err != nil {
+		t.Fatalf("read events: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, event := range events {
+		seen[event.EventType] = true
+	}
+	for _, want := range []string{"CodingCheckFailed", "CodingAutoFixStarted", "CodingAutoFixCompleted", "TaskCompleted"} {
+		if !seen[want] {
+			t.Fatalf("missing %s in %+v", want, events)
+		}
+	}
 }
 
 func TestInteractiveWorkflowRecordsHumanWaitWhenNeeded(t *testing.T) {
@@ -288,7 +619,7 @@ func TestInteractiveWorkflowRecordsHumanWaitWhenNeeded(t *testing.T) {
 	}}
 	cfg := config.Default()
 	cfg.Interactive.HumanTimeoutSeconds = 1
-	result, err := Execute(ctx, store, NewRegistry(), &TaskHandle{
+	_, err := Execute(ctx, store, NewRegistry(), &TaskHandle{
 		StreamID:     "task:interactive",
 		WorkflowType: "interactive",
 		SessionID:    "task:interactive",
@@ -297,13 +628,10 @@ func TestInteractiveWorkflowRecordsHumanWaitWhenNeeded(t *testing.T) {
 		Config:       cfg,
 		Client:       client,
 	})
-	if err != nil {
-		t.Fatalf("execute interactive: %v", err)
+	if !errors.Is(err, ErrWorkflowSuspended) {
+		t.Fatalf("execute interactive err = %v, want suspended", err)
 	}
-	if result.Result != "final interactive" {
-		t.Fatalf("result = %v", result.Result)
-	}
-	assertEvents(t, store, "task:interactive", "InteractiveRoundStarted", "WaitingForHumanInput", "TaskCompleted")
+	assertEvents(t, store, "task:interactive", "InteractiveRoundStarted", "WaitingForHumanInput", "TimerScheduled", "TaskPaused", "RunPaused")
 }
 
 func assertEvents(t *testing.T, store interface {

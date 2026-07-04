@@ -14,6 +14,7 @@ import (
 	"github.com/tenet/orchestrator/internal/guard"
 	"github.com/tenet/orchestrator/internal/storage"
 	"github.com/tenet/orchestrator/internal/worker"
+	workspacepkg "github.com/tenet/orchestrator/internal/workspace"
 )
 
 type WorkflowFunc func(context.Context, *WorkflowContext, *TaskHandle) (any, error)
@@ -24,6 +25,8 @@ type TaskHandle struct {
 	Mode         ContextMode
 	WorkflowType string
 	SessionID    string
+	TurnID       string
+	RunID        string
 	Query        string
 	Workspace    string
 	SystemPrompt string
@@ -39,6 +42,8 @@ type TaskHandle struct {
 
 	lockMu       sync.RWMutex
 	fencingLease guard.FencingLease
+	tokenMu      sync.Mutex
+	tokenUsed    int64
 }
 
 type TaskResult struct {
@@ -98,6 +103,12 @@ func Execute(ctx context.Context, store storage.Store, registry *Registry, task 
 	if task.SessionID == "" {
 		task.SessionID = task.StreamID
 	}
+	if task.TurnID == "" {
+		task.TurnID = "turn:" + task.StreamID
+	}
+	if task.RunID == "" {
+		task.RunID = "run:" + task.TurnID
+	}
 	if task.AgentRole == "" {
 		task.AgentRole = "default"
 	}
@@ -127,12 +138,80 @@ func Execute(ctx context.Context, store storage.Store, registry *Registry, task 
 	if err != nil {
 		return nil, err
 	}
+	if task.Mode == ContextModeExecution {
+		if err := wfctx.Record(runCtx, "RunStarted", map[string]any{
+			"session_id":    task.SessionID,
+			"turn_id":       task.TurnID,
+			"run_id":        task.RunID,
+			"workflow_type": task.WorkflowType,
+			"query":         task.Query,
+			"workspace":     task.Workspace,
+		}); err != nil {
+			return nil, err
+		}
+	}
 	result, runErr := fn(runCtx, wfctx, task)
-	if runErr != nil {
-		_ = wfctx.Record(runCtx, "TaskFailed", map[string]any{"error": runErr.Error()})
+	if errors.Is(runErr, ErrWorkflowSuspended) {
+		_ = wfctx.Record(runCtx, "TaskPaused", map[string]any{
+			"session_id": task.SessionID,
+			"turn_id":    task.TurnID,
+			"run_id":     task.RunID,
+			"reason":     runErr.Error(),
+		})
+		if task.Mode == ContextModeExecution {
+			_ = wfctx.Record(runCtx, "RunPaused", map[string]any{
+				"session_id": task.SessionID,
+				"turn_id":    task.TurnID,
+				"run_id":     task.RunID,
+				"reason":     runErr.Error(),
+			})
+		}
+	} else if runErr != nil {
+		_ = wfctx.Record(runCtx, "TaskFailed", map[string]any{
+			"session_id": task.SessionID,
+			"turn_id":    task.TurnID,
+			"run_id":     task.RunID,
+			"error":      runErr.Error(),
+		})
+		if task.Mode == ContextModeExecution {
+			_ = wfctx.Record(runCtx, "RunFailed", map[string]any{
+				"session_id": task.SessionID,
+				"turn_id":    task.TurnID,
+				"run_id":     task.RunID,
+				"error":      runErr.Error(),
+			})
+		}
+	} else if task.Mode == ContextModeExecution {
+		_ = wfctx.Record(runCtx, "RunCompleted", map[string]any{
+			"session_id":   task.SessionID,
+			"turn_id":      task.TurnID,
+			"run_id":       task.RunID,
+			"final_answer": fmt.Sprint(result),
+			"result":       result,
+		})
+	}
+	if runErr == nil && wfctx.GetVersion("summary-memory", 2) >= 2 {
+		_ = wfctx.Record(runCtx, "SessionSummaryCreated", map[string]any{
+			"session_id": task.SessionID,
+			"turn_id":    task.TurnID,
+			"run_id":     task.RunID,
+			"query":      task.Query,
+			"summary":    summarizeText(fmt.Sprintf("User: %s\nAssistant: %v", task.Query, result), 1200),
+		})
+		_ = wfctx.Record(runCtx, "WorkspaceSummaryCreated", map[string]any{
+			"session_id": task.SessionID,
+			"turn_id":    task.TurnID,
+			"run_id":     task.RunID,
+			"workspace":  task.Workspace,
+			"summary":    summarizeText(fmt.Sprintf("Workspace %s after run %s", task.Workspace, task.RunID), 1200),
+		})
 	}
 	if err := wfctx.Commit(runCtx); err != nil {
 		return nil, err
+	}
+	if task.Mode == ContextModeExecution && runErr == nil {
+		_ = task.saveRunMemory(runCtx, store, result)
+		_ = task.captureRunCheckpoint(runCtx, store)
 	}
 	return &TaskResult{
 		StreamID: task.StreamID,
@@ -140,6 +219,92 @@ func Execute(ctx context.Context, store storage.Store, registry *Registry, task 
 		Result:   result,
 		Err:      runErr,
 	}, runErr
+}
+
+func summarizeText(value string, maxChars int) string {
+	value = strings.TrimSpace(value)
+	if maxChars <= 0 || len(value) <= maxChars {
+		return value
+	}
+	return value[:maxChars] + "...truncated..."
+}
+
+func (task *TaskHandle) saveRunMemory(ctx context.Context, store storage.Store, result any) error {
+	sessionSummary := summarizeText(fmt.Sprintf("User: %s\nAssistant: %v", task.Query, result), 1200)
+	if strings.TrimSpace(sessionSummary) != "" {
+		if _, err := store.SaveMemoryEntry(ctx, storage.MemoryEntry{
+			StreamID: task.StreamID,
+			TurnID:   task.TurnID,
+			RunID:    task.RunID,
+			Kind:     "session_summary",
+			Content:  sessionSummary,
+		}); err != nil {
+			return err
+		}
+	}
+	workspaceSummary := summarizeText(fmt.Sprintf("Workspace %s after run %s", task.Workspace, task.RunID), 1200)
+	if strings.TrimSpace(workspaceSummary) != "" {
+		if _, err := store.SaveMemoryEntry(ctx, storage.MemoryEntry{
+			StreamID: task.StreamID,
+			TurnID:   task.TurnID,
+			RunID:    task.RunID,
+			Kind:     "workspace_summary",
+			Content:  workspaceSummary,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (task *TaskHandle) captureRunCheckpoint(ctx context.Context, store storage.Store) error {
+	if task.Config == nil || strings.TrimSpace(task.Config.Workspace.SnapshotDriver) == "" {
+		return nil
+	}
+	seq, err := store.LatestSeq(task.StreamID)
+	if err != nil {
+		return err
+	}
+	state := map[string]any{
+		"session_id":    task.SessionID,
+		"turn_id":       task.TurnID,
+		"run_id":        task.RunID,
+		"workflow_type": task.WorkflowType,
+		"checkpoint":    "run_completed",
+	}
+	result, err := workspacepkg.NewManager(task.Config).CaptureSnapshot(ctx, store, task.StreamID, task.Workspace, task.SessionID, seq+1, state, task.LockManager, task.CurrentFencingLease())
+	if err != nil {
+		_, appendErr := store.AppendEvent(ctx, storage.AppendEvent{
+			StreamID:  task.StreamID,
+			EventType: "WorkspaceCheckpointFailed",
+			Payload: map[string]any{
+				"session_id": task.SessionID,
+				"turn_id":    task.TurnID,
+				"run_id":     task.RunID,
+				"workspace":  task.Workspace,
+				"error":      err.Error(),
+			},
+		})
+		if appendErr != nil {
+			return appendErr
+		}
+		return err
+	}
+	_, err = store.AppendEvent(ctx, storage.AppendEvent{
+		StreamID:  task.StreamID,
+		EventType: "WorkspaceCheckpointCreated",
+		Payload: map[string]any{
+			"session_id":     task.SessionID,
+			"turn_id":        task.TurnID,
+			"run_id":         task.RunID,
+			"workspace":      task.Workspace,
+			"snapshot_type":  result.Snapshot.Type,
+			"snapshot_ref":   result.Snapshot.Ref,
+			"snapshot_seq":   result.Snapshot.StreamSeq,
+			"snapshot_event": result.Event.StreamSeq,
+		},
+	})
+	return err
 }
 
 func (task *TaskHandle) acquireSessionLease(ctx context.Context) (context.Context, func(), error) {

@@ -58,6 +58,7 @@ agent:
 
 safety:
   require_approval: []
+  tool_allowlist: []
   max_auto_fix_retries: 3
   shell_dangerous_patterns:
     - "rm -rf /"

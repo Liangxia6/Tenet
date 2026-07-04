@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
@@ -20,6 +21,21 @@ func setupDB(t *testing.T) *sql.DB {
 		t.Fatalf("init schema: %v", err)
 	}
 	return db
+}
+
+func TestInitSchemaRecordsMigrationVersion(t *testing.T) {
+	db := setupDB(t)
+	defer db.Close()
+	if err := InitSchema(db); err != nil {
+		t.Fatalf("InitSchema second run: %v", err)
+	}
+	versions, err := AppliedSchemaVersions(db)
+	if err != nil {
+		t.Fatalf("AppliedSchemaVersions: %v", err)
+	}
+	if len(versions) != 1 || versions[0] != CurrentSchemaVersion {
+		t.Fatalf("versions = %+v, want current version %d", versions, CurrentSchemaVersion)
+	}
 }
 
 func TestSQLiteStoreAppendAndRead(t *testing.T) {
@@ -53,6 +69,73 @@ func TestSQLiteStoreAppendAndRead(t *testing.T) {
 	}
 	if events[0].StreamSeq != 1 {
 		t.Errorf("expected seq=1, got %d", events[0].StreamSeq)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(events[0].Payload), &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if payload["schema_version"] != float64(1) {
+		t.Fatalf("payload = %+v, want schema_version=1", payload)
+	}
+}
+
+func TestSQLiteStorePreservesExplicitSchemaVersion(t *testing.T) {
+	db := setupDB(t)
+	store := NewSQLiteStore(db, SQLiteOptions{QueueSize: 8})
+	defer store.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	evt, err := store.AppendEvent(ctx, AppendEvent{
+		StreamID:  "task:schema",
+		EventType: "TaskStarted",
+		Payload:   map[string]any{"schema_version": 2, "query": "hello"},
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(evt.Payload), &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if payload["schema_version"] != float64(2) {
+		t.Fatalf("payload = %+v, want schema_version=2", payload)
+	}
+}
+
+func TestSQLiteStoreRedactsSensitivePayloadFields(t *testing.T) {
+	db := setupDB(t)
+	store := NewSQLiteStore(db, SQLiteOptions{QueueSize: 8})
+	defer store.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	evt, err := store.AppendEvent(ctx, AppendEvent{
+		StreamID:  "task:redact",
+		EventType: "SecretEvent",
+		Payload: map[string]any{
+			"api_key": "sk-secret",
+			"nested":  map[string]any{"authorization": "Bearer secret"},
+			"items":   []any{map[string]any{"password": "pw"}},
+			"query":   "keep me",
+		},
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(evt.Payload), &payload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if payload["api_key"] != "[REDACTED]" || payload["query"] != "keep me" {
+		t.Fatalf("payload = %+v", payload)
+	}
+	nested := payload["nested"].(map[string]any)
+	if nested["authorization"] != "[REDACTED]" {
+		t.Fatalf("nested = %+v", nested)
+	}
+	items := payload["items"].([]any)
+	item := items[0].(map[string]any)
+	if item["password"] != "[REDACTED]" {
+		t.Fatalf("item = %+v", item)
 	}
 }
 
@@ -233,5 +316,33 @@ func TestSQLiteStoreSaveAndReadProjectionSnapshot(t *testing.T) {
 	}
 	if snapshot.StreamSeq != 5 || snapshot.StateBlob == "" {
 		t.Fatalf("snapshot = %+v", snapshot)
+	}
+}
+
+func TestSQLiteStoreMemoryFTS(t *testing.T) {
+	db := setupDB(t)
+	store := NewSQLiteStore(db, SQLiteOptions{QueueSize: 8})
+	defer store.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	entry, err := store.SaveMemoryEntry(ctx, MemoryEntry{
+		StreamID: "task:memory",
+		TurnID:   "turn:1",
+		RunID:    "run:1",
+		Kind:     "session_summary",
+		Content:  "Tenet fixed a parser bug and ran tests.",
+	})
+	if err != nil {
+		t.Fatalf("SaveMemoryEntry: %v", err)
+	}
+	if entry.ID == 0 {
+		t.Fatalf("entry = %+v", entry)
+	}
+	results, err := store.SearchMemory(ctx, "parser", 10)
+	if err != nil {
+		t.Fatalf("SearchMemory: %v", err)
+	}
+	if len(results) != 1 || results[0].StreamID != "task:memory" || results[0].Kind != "session_summary" {
+		t.Fatalf("results = %+v", results)
 	}
 }

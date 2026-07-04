@@ -259,6 +259,7 @@ type AgentConfig struct {
 
 type SafetyConfig struct {
 	RequireApproval        []string `yaml:"require_approval"`
+	ToolAllowlist          []string `yaml:"tool_allowlist"`
 	MaxAutoFixRetries      int      `yaml:"max_auto_fix_retries"`
 	ShellDangerousPatterns []string `yaml:"shell_dangerous_patterns"`
 }

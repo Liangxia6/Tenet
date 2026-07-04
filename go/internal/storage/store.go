@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,6 +33,8 @@ type Store interface {
 	LatestSnapshot(streamID string, maxSeq int64) (SnapshotRecord, error)
 	SaveProjectionSnapshot(ctx context.Context, snapshot ProjectionSnapshot) (ProjectionSnapshot, error)
 	LatestProjectionSnapshot(streamID string) (ProjectionSnapshot, error)
+	SaveMemoryEntry(ctx context.Context, entry MemoryEntry) (MemoryEntry, error)
+	SearchMemory(ctx context.Context, query string, limit int) ([]MemoryEntry, error)
 	ForkStream(ctx context.Context, parentStreamID string, forkFromSeq int64, newQuery string) (string, error)
 	GetLineage(streamID string) ([]string, error)
 	GetChildStreams(streamID string) ([]string, error)
@@ -64,6 +67,16 @@ type ProjectionSnapshot struct {
 	StateBlob string
 	CreatedAt time.Time
 	UpdatedAt time.Time
+}
+
+type MemoryEntry struct {
+	ID        int64
+	StreamID  string
+	TurnID    string
+	RunID     string
+	Kind      string
+	Content   string
+	CreatedAt time.Time
 }
 
 type AppendEvent struct {
@@ -349,6 +362,67 @@ func (s *SQLiteStore) LatestProjectionSnapshot(streamID string) (ProjectionSnaps
 	return snapshot, nil
 }
 
+func (s *SQLiteStore) SaveMemoryEntry(ctx context.Context, entry MemoryEntry) (MemoryEntry, error) {
+	if entry.StreamID == "" {
+		return MemoryEntry{}, fmt.Errorf("stream_id is required")
+	}
+	if entry.Kind == "" {
+		return MemoryEntry{}, fmt.Errorf("memory kind is required")
+	}
+	if strings.TrimSpace(entry.Content) == "" {
+		return MemoryEntry{}, fmt.Errorf("memory content is required")
+	}
+	result, err := s.Append(ctx, &WriteRequest{Statements: []WriteStatement{{
+		SQL: `INSERT INTO memory_entries(stream_id, turn_id, run_id, kind, content)
+			VALUES(?,?,?,?,?)`,
+		Args: []any{entry.StreamID, entry.TurnID, entry.RunID, entry.Kind, entry.Content},
+	}}})
+	if err != nil {
+		return MemoryEntry{}, err
+	}
+	entry.ID = result.LastInsertID
+	entry.CreatedAt = time.Now().UTC()
+	if _, err := s.Append(ctx, &WriteRequest{Statements: []WriteStatement{{
+		SQL:  `INSERT INTO memory_entries_fts(rowid, content, kind, stream_id) VALUES(?,?,?,?)`,
+		Args: []any{entry.ID, entry.Content, entry.Kind, entry.StreamID},
+	}}}); err != nil {
+		return MemoryEntry{}, err
+	}
+	return entry, nil
+}
+
+func (s *SQLiteStore) SearchMemory(ctx context.Context, query string, limit int) ([]MemoryEntry, error) {
+	if strings.TrimSpace(query) == "" {
+		return nil, fmt.Errorf("query is required")
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT m.id, m.stream_id, m.turn_id, m.run_id, m.kind, m.content, m.created_at
+		FROM memory_entries_fts f
+		JOIN memory_entries m ON m.id = f.rowid
+		WHERE memory_entries_fts MATCH ?
+		ORDER BY rank
+		LIMIT ?
+	`, query, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	entries := []MemoryEntry{}
+	for rows.Next() {
+		var entry MemoryEntry
+		var createdAt string
+		if err := rows.Scan(&entry.ID, &entry.StreamID, &entry.TurnID, &entry.RunID, &entry.Kind, &entry.Content, &createdAt); err != nil {
+			return nil, err
+		}
+		entry.CreatedAt = parseSQLiteTime(createdAt)
+		entries = append(entries, entry)
+	}
+	return entries, rows.Err()
+}
+
 func (s *SQLiteStore) ForkStream(ctx context.Context, parentStreamID string, forkFromSeq int64, newQuery string) (string, error) {
 	job := &forkJob{
 		parentStreamID: parentStreamID,
@@ -569,7 +643,7 @@ func (s *SQLiteStore) execAppend(job *appendJob) ([]Event, error) {
 		if input.EventType == "" {
 			return nil, fmt.Errorf("event_type is required")
 		}
-		payload, err := json.Marshal(input.Payload)
+		payload, err := encodeEventPayload(input.Payload)
 		if err != nil {
 			return nil, fmt.Errorf("marshal payload: %w", err)
 		}
@@ -617,6 +691,66 @@ func (s *SQLiteStore) execAppend(job *appendJob) ([]Event, error) {
 	}
 	committed = true
 	return appended, nil
+}
+
+func encodeEventPayload(payload any) ([]byte, error) {
+	if payload == nil {
+		return []byte(`{"schema_version":1}`), nil
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	var object map[string]any
+	if err := json.Unmarshal(data, &object); err != nil {
+		return data, nil
+	}
+	if object == nil {
+		return data, nil
+	}
+	if _, ok := object["schema_version"]; !ok {
+		object["schema_version"] = 1
+	}
+	object = redactEventObject(object)
+	return json.Marshal(object)
+}
+
+func redactEventObject(values map[string]any) map[string]any {
+	out := make(map[string]any, len(values))
+	for key, value := range values {
+		if sensitiveKey(key) {
+			out[key] = "[REDACTED]"
+			continue
+		}
+		out[key] = redactEventValue(value)
+	}
+	return out
+}
+
+func redactEventValue(value any) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return redactEventObject(typed)
+	case []any:
+		out := make([]any, len(typed))
+		for i, item := range typed {
+			out[i] = redactEventValue(item)
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func sensitiveKey(key string) bool {
+	key = strings.ToLower(key)
+	return strings.Contains(key, "api_key") ||
+		strings.Contains(key, "apikey") ||
+		strings.Contains(key, "authorization") ||
+		strings.Contains(key, "password") ||
+		strings.Contains(key, "secret") ||
+		strings.Contains(key, "access_token") ||
+		strings.Contains(key, "refresh_token")
 }
 
 func nullString(value string) sql.NullString {
