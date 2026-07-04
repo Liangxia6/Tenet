@@ -256,6 +256,27 @@ func TestTaskProjectionToolCalls(t *testing.T) {
 	}
 }
 
+func TestTaskProjectionToolApprovalRequired(t *testing.T) {
+	projection := NewTaskProjection("task:approval", 100)
+	events := []storage.Event{
+		{StreamID: "task:approval", StreamSeq: 1, EventType: "ToolCallStarted", Payload: `{"tool_call_id":"call:1","tool_name":"shell"}`},
+		{StreamID: "task:approval", StreamSeq: 2, EventType: "ToolApprovalRequired", Payload: `{"tool_call_id":"call:1","tool_name":"shell","reason":"tool approval required: shell"}`},
+	}
+	for _, event := range events {
+		if err := projection.Apply(event); err != nil {
+			t.Fatalf("apply %s: %v", event.EventType, err)
+		}
+	}
+	view := projection.State()
+	if len(view.ToolCalls) != 1 {
+		t.Fatalf("tool calls = %+v", view.ToolCalls)
+	}
+	call := view.ToolCalls[0]
+	if call.Status != StatusPaused || call.Error != "tool approval required: shell" {
+		t.Fatalf("call = %+v", call)
+	}
+}
+
 func TestTaskProjectionTimerPauseResume(t *testing.T) {
 	projection := NewTaskProjection("task:timer", 10)
 	events := []storage.Event{

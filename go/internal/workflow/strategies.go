@@ -469,6 +469,23 @@ func executeTool(ctx context.Context, wfctx *WorkflowContext, task *TaskHandle, 
 		}
 		return worker.ExecuteToolResponse{}, err
 	}
+	if task.Config != nil && worker.HasToolAllowlist(task.Config.Safety.RequireApproval) && worker.ToolAllowed(task.Config.Safety.RequireApproval, call.ToolName) {
+		reason := fmt.Sprintf("tool approval required: %s", call.ToolName)
+		if traceTool {
+			if err := wfctx.Record(ctx, "ToolApprovalRequired", map[string]any{
+				"session_id":   task.SessionID,
+				"turn_id":      task.TurnID,
+				"run_id":       task.RunID,
+				"tool_call_id": callID,
+				"tool_name":    call.ToolName,
+				"arguments":    call.Arguments,
+				"reason":       reason,
+			}); err != nil {
+				return worker.ExecuteToolResponse{}, err
+			}
+		}
+		return worker.ExecuteToolResponse{}, SuspensionError{Reason: reason}
+	}
 	if err := task.CheckToolRateLimit(ctx, call.ToolName); err != nil {
 		if traceTool {
 			_ = wfctx.Record(ctx, "ToolCallFailed", toolFailurePayload(task, callID, call, "RATE_LIMITED", err.Error(), startedAt, worker.ExecuteToolResponse{}))

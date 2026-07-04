@@ -466,6 +466,12 @@ func (p *TaskProjection) Apply(event storage.Event) error {
 			p.completeToolCall(callID, StatusCompleted, event.StreamSeq, payload)
 			p.appendTimeline(event, TimelineStep{Seq: event.StreamSeq, Type: "tool_completed", ToolName: stringValue(payload, "tool_name"), Stdout: stringValue(payload, "stdout"), Stderr: stringValue(payload, "stderr"), DurationMS: int64Value(payload, "duration_ms"), Timestamp: event.Timestamp})
 		}
+	case "ToolApprovalRequired":
+		callID := stringValue(payload, "tool_call_id")
+		if callID != "" {
+			p.completeToolCall(callID, StatusPaused, event.StreamSeq, payload)
+			p.appendTimeline(event, TimelineStep{Seq: event.StreamSeq, Type: "tool_approval_required", ToolName: stringValue(payload, "tool_name"), Content: stringValue(payload, "reason"), Timestamp: event.Timestamp})
+		}
 	case "ToolCallFailed":
 		callID := stringValue(payload, "tool_call_id")
 		if callID != "" {
@@ -871,7 +877,7 @@ func (p *TaskProjection) completeToolCall(callID string, status TaskStatus, seq 
 	call.CompletedSeq = seq
 	call.ToolName = firstNonEmpty(stringValue(payload, "tool_name"), call.ToolName)
 	call.ErrorCode = firstNonEmpty(stringValue(payload, "error_code"), call.ErrorCode)
-	call.Error = firstNonEmpty(stringValue(payload, "error"), call.Error)
+	call.Error = firstNonEmpty(stringValue(payload, "error"), stringValue(payload, "reason"), call.Error)
 	call.Stdout = firstNonEmpty(stringValue(payload, "stdout"), call.Stdout)
 	call.Stderr = firstNonEmpty(stringValue(payload, "stderr"), call.Stderr)
 	call.ExitCode = firstNonZeroInt(intValue(payload, "exit_code"), call.ExitCode)

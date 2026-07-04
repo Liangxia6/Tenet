@@ -193,6 +193,59 @@ func TestReactWorkflowBlocksToolOutsideAllowlistBeforeClientCall(t *testing.T) {
 	}
 }
 
+func TestReactWorkflowSuspendsWhenToolRequiresApproval(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	store := testStore(t)
+	defer store.Close()
+
+	client := &scriptedGenerator{
+		responses: []worker.GenerateThoughtResponse{{
+			Thought:      "Need shell.",
+			FinishReason: "tool_calls",
+			ToolCalls: []worker.ToolCall{{
+				CallID:    "call_shell",
+				ToolName:  "shell",
+				Arguments: `{"command":"pwd"}`,
+			}},
+		}},
+	}
+	cfg := config.Default()
+	cfg.Agent.DefaultMaxSteps = 2
+	cfg.Safety.RequireApproval = []string{"shell"}
+
+	_, err := Execute(ctx, store, NewRegistry(), &TaskHandle{
+		StreamID:     "task:tool-approval",
+		WorkflowType: "react",
+		SessionID:    "task:tool-approval",
+		Query:        "Use shell",
+		Workspace:    t.TempDir(),
+		SystemPrompt: "Use tools.",
+		Tools:        worker.BuiltinToolDefinitions(),
+		Config:       cfg,
+		Client:       client,
+	})
+	if !errors.Is(err, ErrWorkflowSuspended) {
+		t.Fatalf("error = %v, want workflow suspended", err)
+	}
+	if len(client.toolRequests) != 0 {
+		t.Fatalf("tool requests = %d, want 0", len(client.toolRequests))
+	}
+	events, readErr := store.Read("task:tool-approval", 1)
+	if readErr != nil {
+		t.Fatalf("read events: %v", readErr)
+	}
+	seen := map[string]bool{}
+	for _, evt := range events {
+		seen[evt.EventType] = true
+	}
+	for _, want := range []string{"ToolApprovalRequired", "TaskPaused", "RunPaused"} {
+		if !seen[want] {
+			t.Fatalf("missing %s in %+v", want, events)
+		}
+	}
+}
+
 func TestReactWorkflowRecordsTouchedFilesForMutatingTool(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
