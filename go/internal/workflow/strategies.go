@@ -401,6 +401,24 @@ func generateThought(ctx context.Context, wfctx *WorkflowContext, task *TaskHand
 		if assemblyOpts.TokenBudget > 0 && assembly.EstimatedTokens > assemblyOpts.TokenBudget {
 			return worker.GenerateThoughtResponse{}, fmt.Errorf("context token budget exceeded: estimated=%d budget=%d", assembly.EstimatedTokens, assemblyOpts.TokenBudget)
 		}
+		if err := recordAgentCheckpoint(ctx, wfctx, task, "llm_before_call", map[string]any{
+			"context": map[string]any{
+				"strategy":         assembly.Strategy,
+				"message_count":    len(assembly.Messages),
+				"estimated_tokens": assembly.EstimatedTokens,
+				"token_budget":     assemblyOpts.TokenBudget,
+				"memory_refs":      assembly.MemoryRefs,
+				"omitted_refs":     assembly.OmittedRefs,
+			},
+			"memory": map[string]any{
+				"memory_refs": assembly.MemoryRefs,
+			},
+			"tokens": map[string]any{
+				"used": task.tokenUsed,
+			},
+		}); err != nil {
+			return worker.GenerateThoughtResponse{}, err
+		}
 	}
 	traceLLM := wfctx.GetVersion("llm-call-trace", 2) >= 2
 	callID := ""
@@ -694,6 +712,17 @@ func executeTool(ctx context.Context, wfctx *WorkflowContext, task *TaskHandle, 
 		callID = fmt.Sprintf("tool:%s:%d", task.RunID, wfctx.HistoryPosition()+1)
 	}
 	startedAt := time.Now()
+	if err := recordAgentCheckpoint(ctx, wfctx, task, "tool_before_call", map[string]any{
+		"tool": map[string]any{
+			"tool_call_id": callID,
+			"tool_name":    call.ToolName,
+			"arguments":    call.Arguments,
+			"workspace":    task.Workspace,
+		},
+		"tokens": map[string]any{"used": task.tokenUsed},
+	}); err != nil {
+		return worker.ExecuteToolResponse{}, err
+	}
 	if traceTool {
 		if err := wfctx.Record(ctx, "ToolCallStarted", map[string]any{
 			"session_id":    task.SessionID,
@@ -797,6 +826,20 @@ func executeTool(ctx context.Context, wfctx *WorkflowContext, task *TaskHandle, 
 		}); err != nil {
 			return worker.ExecuteToolResponse{}, err
 		}
+	}
+	if err := recordAgentCheckpoint(ctx, wfctx, task, "tool_after_call", map[string]any{
+		"tool": map[string]any{
+			"tool_call_id":  callID,
+			"tool_name":     call.ToolName,
+			"exit_code":     toolResponse.ExitCode,
+			"touched_files": touchedFiles,
+		},
+		"tokens": map[string]any{"used": task.tokenUsed},
+	}); err != nil {
+		return worker.ExecuteToolResponse{}, err
+	}
+	if err := recordToolArtifactVersions(ctx, wfctx, task, callID, touchedFiles); err != nil {
+		return worker.ExecuteToolResponse{}, err
 	}
 	return toolResponse, nil
 }

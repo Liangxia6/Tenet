@@ -642,6 +642,22 @@ func (p *TaskProjection) Apply(event storage.Event) error {
 		p.appendTimeline(event, TimelineStep{Seq: event.StreamSeq, Type: "workspace_checkpoint", Content: firstNonEmpty(stringValue(payload, "snapshot_ref"), stringValue(payload, "workspace")), Timestamp: event.Timestamp})
 	case "WorkspaceCheckpointFailed":
 		p.appendTimeline(event, TimelineStep{Seq: event.StreamSeq, Type: "workspace_checkpoint_failed", Content: stringValue(payload, "error"), Timestamp: event.Timestamp})
+	case "AgentCheckpointCreated":
+		p.appendTimeline(event, TimelineStep{Seq: event.StreamSeq, Type: "agent_checkpoint", Content: firstNonEmpty(stringValue(payload, "reason"), stringValue(payload, "checkpoint_id")), Timestamp: event.Timestamp})
+	case "ArtifactVersionCreated":
+		p.appendTimeline(event, TimelineStep{Seq: event.StreamSeq, Type: "artifact_version", Content: firstNonEmpty(stringValue(payload, "path"), stringValue(payload, "artifact_id")), Timestamp: event.Timestamp})
+	case "ArtifactRollbackStarted":
+		p.appendTimeline(event, TimelineStep{Seq: event.StreamSeq, Type: "artifact_rollback_started", Content: stringValue(payload, "path"), Timestamp: event.Timestamp})
+	case "ArtifactRollbackCompleted":
+		p.appendTimeline(event, TimelineStep{Seq: event.StreamSeq, Type: "artifact_rollback_completed", Content: stringValue(payload, "path"), Timestamp: event.Timestamp})
+	case "ArtifactRollbackFailed":
+		p.appendTimeline(event, TimelineStep{Seq: event.StreamSeq, Type: "artifact_rollback_failed", Content: firstNonEmpty(stringValue(payload, "error"), stringValue(payload, "path")), Timestamp: event.Timestamp})
+	case "AgentCheckpointRestoreStarted":
+		p.appendTimeline(event, TimelineStep{Seq: event.StreamSeq, Type: "checkpoint_restore_started", Content: stringValue(payload, "checkpoint_id"), Timestamp: event.Timestamp})
+	case "AgentCheckpointRestoreCompleted":
+		p.appendTimeline(event, TimelineStep{Seq: event.StreamSeq, Type: "checkpoint_restore_completed", Content: stringValue(payload, "checkpoint_id"), Timestamp: event.Timestamp})
+	case "AgentCheckpointRestoreFailed":
+		p.appendTimeline(event, TimelineStep{Seq: event.StreamSeq, Type: "checkpoint_restore_failed", Content: firstNonEmpty(stringValue(payload, "error"), stringValue(payload, "checkpoint_id")), Timestamp: event.Timestamp})
 	case "SessionSummaryCreated":
 		p.state.SessionSummary = stringValue(payload, "summary")
 		p.appendTimeline(event, TimelineStep{Seq: event.StreamSeq, Type: "session_summary", Content: p.state.SessionSummary, Timestamp: event.Timestamp})

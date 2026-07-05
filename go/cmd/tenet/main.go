@@ -452,6 +452,12 @@ func taskCmd(args []string) error {
 		return taskWatch(args[1:])
 	case "status":
 		return taskStatus(args[1:])
+	case "trace":
+		return taskTrace(args[1:])
+	case "checkpoints":
+		return taskCheckpoints(args[1:])
+	case "artifacts":
+		return taskArtifacts(args[1:])
 	case "fork":
 		return taskFork(args[1:])
 	case "lineage":
@@ -462,6 +468,8 @@ func taskCmd(args []string) error {
 		return taskCancel(args[1:])
 	case "resume":
 		return taskResume(args[1:])
+	case "restore":
+		return taskRestore(args[1:])
 	default:
 		return fmt.Errorf("unknown task subcommand %q", args[0])
 	}
@@ -841,6 +849,7 @@ func taskReplay(args []string) error {
 	configPath := fs.String("config", "config/tenet.yaml", "path to configuration file")
 	streamID := fs.String("stream", "", "stream id")
 	runID := fs.String("run", "", "optional run id; defaults to latest run in the stream")
+	toSeq := fs.Int64("to-seq", 0, "verify event prefix up to this stream sequence without executing workflow")
 	output := fs.String("output", "text", "output format: text/json")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -857,6 +866,39 @@ func taskReplay(args []string) error {
 		return err
 	}
 	defer store.Close()
+	if *toSeq > 0 {
+		events, err := store.Read(*streamID, 1)
+		if err != nil {
+			return err
+		}
+		prefix := make([]storage.Event, 0, len(events))
+		for _, event := range events {
+			if event.StreamSeq > *toSeq {
+				break
+			}
+			prefix = append(prefix, event)
+		}
+		trace, err := projection.BuildTraceView(*streamID, prefix)
+		if err != nil {
+			return err
+		}
+		if *output == "json" {
+			return json.NewEncoder(os.Stdout).Encode(map[string]any{
+				"stream_id":       *streamID,
+				"to_seq":          *toSeq,
+				"events_replayed": len(prefix),
+				"trace_spans":     len(trace.Spans),
+				"prefix_valid":    true,
+				"trace":           trace,
+			})
+		}
+		fmt.Printf("Replay prefix %s\n", *streamID)
+		fmt.Printf("to_seq:     %d\n", *toSeq)
+		fmt.Printf("events:     %d\n", len(prefix))
+		fmt.Printf("trace_spans:%d\n", len(trace.Spans))
+		fmt.Println("prefix:     VALID")
+		return nil
+	}
 	result, err := workflow.Replay(context.Background(), store, workflow.NewRegistry(), &workflow.TaskHandle{
 		StreamID: *streamID,
 		RunID:    *runID,
@@ -1021,22 +1063,16 @@ func taskStatus(args []string) error {
 	return nil
 }
 
-func taskFork(args []string) error {
-	fs := flag.NewFlagSet("task fork", flag.ContinueOnError)
+func taskTrace(args []string) error {
+	fs := flag.NewFlagSet("task trace", flag.ContinueOnError)
 	configPath := fs.String("config", "config/tenet.yaml", "path to configuration file")
-	streamID := fs.String("stream", "", "parent stream id")
-	seq := fs.Int64("seq", 0, "fork after this stream sequence")
-	query := fs.String("query", "", "new query for the fork")
-	restoreWorkspace := fs.Bool("restore-workspace", true, "initialize fork workspace from the latest snapshot before --seq")
+	streamID := fs.String("stream", "", "stream id")
 	output := fs.String("output", "text", "output format: text/json")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *streamID == "" {
 		return fmt.Errorf("--stream is required")
-	}
-	if *seq <= 0 {
-		return fmt.Errorf("--seq must be positive")
 	}
 	cfg, err := loadConfig(*configPath, true)
 	if err != nil {
@@ -1047,6 +1083,406 @@ func taskFork(args []string) error {
 		return err
 	}
 	defer store.Close()
+	view, err := projection.NewEngine(store, cfg).ProjectTrace(context.Background(), *streamID)
+	if err != nil {
+		return err
+	}
+	if *output == "json" {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(view)
+	}
+	depths := traceDepths(view)
+	fmt.Printf("trace: %s\n", view.StreamID)
+	fmt.Printf("spans: %d\n", len(view.Spans))
+	for _, span := range view.Spans {
+		indent := strings.Repeat("  ", depths[span.ID])
+		status := span.Status
+		if status == "" {
+			status = projection.StatusRunning
+		}
+		fmt.Printf("%s- [%s] %s %s seq=%d", indent, status, span.Type, span.Name, span.StartedSeq)
+		if span.CompletedSeq > 0 {
+			fmt.Printf("..%d", span.CompletedSeq)
+		}
+		if span.Error != "" {
+			fmt.Printf(" error=%s", span.Error)
+		}
+		fmt.Println()
+	}
+	return nil
+}
+
+func traceDepths(view projection.TraceView) map[string]int {
+	parentByID := map[string]string{}
+	for _, span := range view.Spans {
+		parentByID[span.ID] = span.ParentID
+	}
+	depths := map[string]int{}
+	var depthOf func(string) int
+	depthOf = func(spanID string) int {
+		if depth, ok := depths[spanID]; ok {
+			return depth
+		}
+		parentID := parentByID[spanID]
+		if parentID == "" {
+			depths[spanID] = 0
+			return 0
+		}
+		depths[spanID] = depthOf(parentID) + 1
+		return depths[spanID]
+	}
+	for _, span := range view.Spans {
+		depthOf(span.ID)
+	}
+	return depths
+}
+
+func taskCheckpoints(args []string) error {
+	fs := flag.NewFlagSet("task checkpoints", flag.ContinueOnError)
+	configPath := fs.String("config", "config/tenet.yaml", "path to configuration file")
+	streamID := fs.String("stream", "", "stream id")
+	limit := fs.Int("limit", 100, "maximum number of checkpoints")
+	output := fs.String("output", "text", "output format: text/json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *streamID == "" {
+		return fmt.Errorf("--stream is required")
+	}
+	cfg, err := loadConfig(*configPath, true)
+	if err != nil {
+		return err
+	}
+	store, err := storage.Open(cfg.Database.Path, storage.SQLiteOptions{QueueSize: cfg.Database.WriteQueueSize})
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	checkpoints, err := store.ListAgentCheckpoints(context.Background(), *streamID, *limit)
+	if err != nil {
+		return err
+	}
+	if *output == "json" {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(checkpoints)
+	}
+	fmt.Printf("checkpoints: %s (%d)\n", *streamID, len(checkpoints))
+	for _, checkpoint := range checkpoints {
+		fmt.Printf("- %s reason=%s seq=%d run=%s phase=%s\n", checkpoint.ID, checkpoint.Reason, checkpoint.EventSeq, checkpoint.RunID, checkpoint.WorkflowPhase)
+	}
+	return nil
+}
+
+func taskArtifacts(args []string) error {
+	fs := flag.NewFlagSet("task artifacts", flag.ContinueOnError)
+	configPath := fs.String("config", "config/tenet.yaml", "path to configuration file")
+	streamID := fs.String("stream", "", "stream id")
+	path := fs.String("path", "", "artifact path; when set, show versions")
+	rollbackVersion := fs.Int("rollback-version", 0, "rollback artifact path to this version")
+	workspace := fs.String("workspace", "", "workspace override for rollback")
+	output := fs.String("output", "text", "output format: text/json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *streamID == "" {
+		return fmt.Errorf("--stream is required")
+	}
+	cfg, err := loadConfig(*configPath, true)
+	if err != nil {
+		return err
+	}
+	store, err := storage.Open(cfg.Database.Path, storage.SQLiteOptions{QueueSize: cfg.Database.WriteQueueSize})
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if *rollbackVersion > 0 {
+		if *path == "" {
+			return fmt.Errorf("--path is required with --rollback-version")
+		}
+		result, err := rollbackArtifact(context.Background(), store, *streamID, *path, *rollbackVersion, *workspace)
+		if err != nil {
+			return err
+		}
+		if *output == "json" {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			return enc.Encode(result)
+		}
+		fmt.Printf("rolled back %s to v%d -> new version %s\n", result.Path, *rollbackVersion, result.VersionID)
+		return nil
+	}
+	if *path != "" {
+		versions, err := store.ListArtifactVersions(context.Background(), *streamID, *path)
+		if err != nil {
+			return err
+		}
+		if *output == "json" {
+			enc := json.NewEncoder(os.Stdout)
+			enc.SetIndent("", "  ")
+			return enc.Encode(versions)
+		}
+		fmt.Printf("artifact: %s %s (%d versions)\n", *streamID, *path, len(versions))
+		for _, version := range versions {
+			fmt.Printf("- v%d %s seq=%d tool=%s size=%d\n", version.Version, version.ID, version.EventSeq, version.ProducerToolCallID, version.SizeBytes)
+		}
+		return nil
+	}
+	artifacts, err := store.ListArtifacts(context.Background(), *streamID)
+	if err != nil {
+		return err
+	}
+	if *output == "json" {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(artifacts)
+	}
+	fmt.Printf("artifacts: %s (%d)\n", *streamID, len(artifacts))
+	for _, artifact := range artifacts {
+		fmt.Printf("- %s type=%s current=%s\n", artifact.Path, artifact.ArtifactType, artifact.CurrentVersionID)
+	}
+	return nil
+}
+
+type artifactRollbackResult struct {
+	StreamID  string `json:"stream_id"`
+	Path      string `json:"path"`
+	Version   int    `json:"version"`
+	VersionID string `json:"version_id"`
+	Workspace string `json:"workspace"`
+}
+
+func rollbackArtifact(ctx context.Context, store storage.Store, streamID, artifactPath string, versionNumber int, workspaceOverride string) (artifactRollbackResult, error) {
+	target, err := store.GetArtifactVersion(ctx, streamID, artifactPath, versionNumber)
+	if err != nil {
+		return artifactRollbackResult{}, err
+	}
+	workspace := firstNonEmpty(workspaceOverride, target.Workspace)
+	if workspace == "" {
+		return artifactRollbackResult{}, fmt.Errorf("workspace is required")
+	}
+	abs, err := safeArtifactTarget(workspace, target.Path)
+	if err != nil {
+		return artifactRollbackResult{}, err
+	}
+	started, err := store.AppendEvent(ctx, storage.AppendEvent{
+		StreamID:  streamID,
+		EventType: "ArtifactRollbackStarted",
+		Payload: map[string]any{
+			"artifact_id": target.ArtifactID,
+			"path":        target.Path,
+			"to_version":  versionNumber,
+			"workspace":   workspace,
+		},
+	})
+	if err != nil {
+		return artifactRollbackResult{}, err
+	}
+	if err := os.MkdirAll(filepath.Dir(abs), 0755); err != nil {
+		_, _ = store.AppendEvent(ctx, storage.AppendEvent{StreamID: streamID, EventType: "ArtifactRollbackFailed", Payload: map[string]any{"path": target.Path, "error": err.Error()}})
+		return artifactRollbackResult{}, err
+	}
+	if err := os.WriteFile(abs, []byte(target.ContentBlob), 0644); err != nil {
+		_, _ = store.AppendEvent(ctx, storage.AppendEvent{StreamID: streamID, EventType: "ArtifactRollbackFailed", Payload: map[string]any{"path": target.Path, "error": err.Error()}})
+		return artifactRollbackResult{}, err
+	}
+	newVersion, err := store.RecordArtifactVersion(ctx, storage.ArtifactVersion{
+		StreamID:           streamID,
+		TurnID:             target.TurnID,
+		RunID:              target.RunID,
+		Workspace:          workspace,
+		Path:               target.Path,
+		ArtifactType:       target.ArtifactType,
+		EventSeq:           started.StreamSeq,
+		ProducerToolCallID: "rollback",
+		ContentHash:        target.ContentHash,
+		ContentBlob:        target.ContentBlob,
+		SizeBytes:          int64(len(target.ContentBlob)),
+		Summary:            fmt.Sprintf("rollback to version %d", versionNumber),
+	})
+	if err != nil {
+		_, _ = store.AppendEvent(ctx, storage.AppendEvent{StreamID: streamID, EventType: "ArtifactRollbackFailed", Payload: map[string]any{"path": target.Path, "error": err.Error()}})
+		return artifactRollbackResult{}, err
+	}
+	if _, err := store.AppendEvent(ctx, storage.AppendEvent{
+		StreamID:  streamID,
+		EventType: "ArtifactVersionCreated",
+		Payload: map[string]any{
+			"artifact_id":           newVersion.ArtifactID,
+			"version_id":            newVersion.ID,
+			"version":               newVersion.Version,
+			"path":                  newVersion.Path,
+			"artifact_type":         newVersion.ArtifactType,
+			"content_hash":          newVersion.ContentHash,
+			"size_bytes":            newVersion.SizeBytes,
+			"producer_tool_call_id": "rollback",
+			"event_seq":             newVersion.EventSeq,
+		},
+	}); err != nil {
+		return artifactRollbackResult{}, err
+	}
+	if _, err := store.AppendEvent(ctx, storage.AppendEvent{
+		StreamID:  streamID,
+		EventType: "ArtifactRollbackCompleted",
+		Payload: map[string]any{
+			"artifact_id": target.ArtifactID,
+			"path":        target.Path,
+			"to_version":  versionNumber,
+			"version_id":  newVersion.ID,
+			"workspace":   workspace,
+		},
+	}); err != nil {
+		return artifactRollbackResult{}, err
+	}
+	return artifactRollbackResult{StreamID: streamID, Path: target.Path, Version: newVersion.Version, VersionID: newVersion.ID, Workspace: workspace}, nil
+}
+
+func safeArtifactTarget(workspace string, rel string) (string, error) {
+	if filepath.IsAbs(rel) {
+		return "", fmt.Errorf("artifact path must be relative")
+	}
+	clean := filepath.Clean(rel)
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("artifact path escapes workspace")
+	}
+	return filepath.Join(workspace, clean), nil
+}
+
+func taskRestore(args []string) error {
+	fs := flag.NewFlagSet("task restore", flag.ContinueOnError)
+	configPath := fs.String("config", "config/tenet.yaml", "path to configuration file")
+	streamID := fs.String("stream", "", "stream id")
+	checkpointID := fs.String("checkpoint", "", "checkpoint id")
+	workspace := fs.String("workspace", "", "workspace to restore into")
+	output := fs.String("output", "text", "output format: text/json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *streamID == "" || *checkpointID == "" || *workspace == "" {
+		return fmt.Errorf("--stream, --checkpoint and --workspace are required")
+	}
+	cfg, err := loadConfig(*configPath, true)
+	if err != nil {
+		return err
+	}
+	store, err := storage.Open(cfg.Database.Path, storage.SQLiteOptions{QueueSize: cfg.Database.WriteQueueSize})
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	result, err := restoreCheckpoint(context.Background(), store, cfg, *streamID, *checkpointID, *workspace)
+	if err != nil {
+		return err
+	}
+	if *output == "json" {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(result)
+	}
+	fmt.Printf("restored checkpoint %s into %s from %s\n", result.CheckpointID, result.Workspace, result.SnapshotRef)
+	return nil
+}
+
+type checkpointRestoreResult struct {
+	StreamID     string `json:"stream_id"`
+	CheckpointID string `json:"checkpoint_id"`
+	Workspace    string `json:"workspace"`
+	SnapshotType string `json:"snapshot_type"`
+	SnapshotRef  string `json:"snapshot_ref"`
+	SnapshotSeq  int64  `json:"snapshot_seq"`
+}
+
+func restoreCheckpoint(ctx context.Context, store storage.Store, cfg *config.RuntimeConfig, streamID, checkpointID, workspace string) (checkpointRestoreResult, error) {
+	if strings.TrimSpace(checkpointID) == "" {
+		return checkpointRestoreResult{}, fmt.Errorf("checkpoint_id is required")
+	}
+	if strings.TrimSpace(workspace) == "" {
+		return checkpointRestoreResult{}, fmt.Errorf("workspace is required")
+	}
+	checkpoint, err := store.GetAgentCheckpoint(ctx, checkpointID)
+	if err != nil {
+		return checkpointRestoreResult{}, err
+	}
+	if checkpoint.StreamID != streamID {
+		return checkpointRestoreResult{}, fmt.Errorf("checkpoint %s belongs to stream %s", checkpointID, checkpoint.StreamID)
+	}
+	snapshot, err := store.LatestSnapshot(streamID, checkpoint.EventSeq)
+	if err != nil {
+		_, _ = store.AppendEvent(ctx, storage.AppendEvent{StreamID: streamID, EventType: "AgentCheckpointRestoreFailed", Payload: map[string]any{"checkpoint_id": checkpointID, "workspace": workspace, "error": err.Error()}})
+		return checkpointRestoreResult{}, err
+	}
+	if _, err := store.AppendEvent(ctx, storage.AppendEvent{
+		StreamID:  streamID,
+		EventType: "AgentCheckpointRestoreStarted",
+		Payload: map[string]any{
+			"checkpoint_id": checkpointID,
+			"workspace":     workspace,
+			"snapshot_type": snapshot.Type,
+			"snapshot_ref":  snapshot.Ref,
+			"snapshot_seq":  snapshot.StreamSeq,
+		},
+	}); err != nil {
+		return checkpointRestoreResult{}, err
+	}
+	if err := workspacepkg.NewManager(cfg).Restore(ctx, workspacepkg.Snapshot{Type: snapshot.Type, Ref: snapshot.Ref}, workspace, nil, zeroFencingLease()); err != nil {
+		_, _ = store.AppendEvent(ctx, storage.AppendEvent{StreamID: streamID, EventType: "AgentCheckpointRestoreFailed", Payload: map[string]any{"checkpoint_id": checkpointID, "workspace": workspace, "error": err.Error()}})
+		return checkpointRestoreResult{}, err
+	}
+	if _, err := store.AppendEvent(ctx, storage.AppendEvent{
+		StreamID:  streamID,
+		EventType: "AgentCheckpointRestoreCompleted",
+		Payload: map[string]any{
+			"checkpoint_id": checkpointID,
+			"workspace":     workspace,
+			"snapshot_type": snapshot.Type,
+			"snapshot_ref":  snapshot.Ref,
+			"snapshot_seq":  snapshot.StreamSeq,
+		},
+	}); err != nil {
+		return checkpointRestoreResult{}, err
+	}
+	return checkpointRestoreResult{StreamID: streamID, CheckpointID: checkpointID, Workspace: workspace, SnapshotType: snapshot.Type, SnapshotRef: snapshot.Ref, SnapshotSeq: snapshot.StreamSeq}, nil
+}
+
+func taskFork(args []string) error {
+	fs := flag.NewFlagSet("task fork", flag.ContinueOnError)
+	configPath := fs.String("config", "config/tenet.yaml", "path to configuration file")
+	streamID := fs.String("stream", "", "parent stream id")
+	seq := fs.Int64("seq", 0, "fork after this stream sequence")
+	checkpointID := fs.String("checkpoint", "", "fork from this checkpoint id")
+	query := fs.String("query", "", "new query for the fork")
+	restoreWorkspace := fs.Bool("restore-workspace", true, "initialize fork workspace from the latest snapshot before --seq")
+	output := fs.String("output", "text", "output format: text/json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *streamID == "" {
+		return fmt.Errorf("--stream is required")
+	}
+	cfg, err := loadConfig(*configPath, true)
+	if err != nil {
+		return err
+	}
+	store, err := storage.Open(cfg.Database.Path, storage.SQLiteOptions{QueueSize: cfg.Database.WriteQueueSize})
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if *checkpointID != "" {
+		checkpoint, err := store.GetAgentCheckpoint(context.Background(), *checkpointID)
+		if err != nil {
+			return err
+		}
+		if checkpoint.StreamID != *streamID {
+			return fmt.Errorf("checkpoint %s belongs to stream %s", *checkpointID, checkpoint.StreamID)
+		}
+		*seq = checkpoint.EventSeq
+	}
+	if *seq <= 0 {
+		return fmt.Errorf("--seq or --checkpoint is required")
+	}
 	var fork workspacepkg.ForkResult
 	if *restoreWorkspace {
 		fork, err = workspacepkg.NewManager(cfg).ForkWorkspace(context.Background(), store, *streamID, *seq, *query, nil, zeroFencingLease())

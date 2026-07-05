@@ -894,3 +894,23 @@ Turn 3
 - Restore/Rollback/Fork 本身也可审计、可 replay。
 - 前端可以展示 Trace、Artifact History、Checkpoint Timeline。
 
+## 18. 当前实现进度
+
+截至本轮实现，已落地：
+
+- Phase 1 结构化 Trace：新增 `TraceView / TraceSpan / TraceProjection`，支持 run、phase、context、memory、LLM、tool、checkpoint、artifact、rollback、restore span。
+- Trace 查询入口：新增 HTTP `GET /tasks/{id}/trace`，新增 CLI `task trace --stream ...`。
+- Phase 2 AgentCheckpoint：新增 `agent_checkpoints` 表和 storage API，workflow 在 run started、LLM 前、tool 前后、run completed、workspace checkpoint 后自动创建 checkpoint。
+- Checkpoint 查询入口：新增 HTTP `GET /tasks/{id}/checkpoints`，新增 CLI `task checkpoints --stream ...`。
+- Phase 3 Artifact Registry：新增 `artifacts`、`artifact_versions`、`artifact_diffs` 表；工具写文件后自动生成 artifact version，并记录 `ArtifactVersionCreated`。
+- Artifact 查询入口：新增 HTTP `GET /tasks/{id}/artifacts` 与 `GET /tasks/{id}/artifacts?path=...`，新增 CLI `task artifacts --stream ...`。
+- Phase 4 Artifact Rollback：`artifact_versions` 保存 `content_blob`，支持 `task artifacts --path ... --rollback-version N` 和 HTTP `POST /tasks/{id}/artifacts` 回退文件，并生成新的 artifact version。
+- Phase 5 Checkpoint Restore/Fork：支持 `task restore --checkpoint ... --workspace ...`，HTTP `POST /tasks/{id}/restore`；`task fork` 和 HTTP fork 支持 checkpoint_id 转换为 event seq。
+- Phase 6 Replay 增强：CLI `task replay --to-seq N` 支持事件前缀验证和 Trace 报告；完整 workflow replay 仍用于完整 run deterministic 校验。
+
+后续仍可增强：
+
+- Artifact diff 当前是简单文本 diff，可替换为标准 unified diff，并支持二进制大文件外部存储。
+- Restore 当前要求显式 workspace，后续可从 workspace manager/session metadata 自动推断。
+- Checkpoint 的 context/memory/tool state 已落库为 JSON，但恢复后继续执行的 runtime cursor 还可以进一步产品化。
+- 前端还需要接入 Trace 树、Checkpoint 面板、Artifact History/Diff/Rollback 操作。

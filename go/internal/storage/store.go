@@ -33,6 +33,13 @@ type Store interface {
 	LatestSnapshot(streamID string, maxSeq int64) (SnapshotRecord, error)
 	SaveProjectionSnapshot(ctx context.Context, snapshot ProjectionSnapshot) (ProjectionSnapshot, error)
 	LatestProjectionSnapshot(streamID string) (ProjectionSnapshot, error)
+	SaveAgentCheckpoint(ctx context.Context, checkpoint AgentCheckpoint) (AgentCheckpoint, error)
+	GetAgentCheckpoint(ctx context.Context, id string) (AgentCheckpoint, error)
+	ListAgentCheckpoints(ctx context.Context, streamID string, limit int) ([]AgentCheckpoint, error)
+	RecordArtifactVersion(ctx context.Context, version ArtifactVersion) (ArtifactVersion, error)
+	ListArtifacts(ctx context.Context, streamID string) ([]Artifact, error)
+	ListArtifactVersions(ctx context.Context, streamID string, path string) ([]ArtifactVersion, error)
+	GetArtifactVersion(ctx context.Context, streamID string, path string, version int) (ArtifactVersion, error)
 	SaveMemoryEntry(ctx context.Context, entry MemoryEntry) (MemoryEntry, error)
 	SearchMemory(ctx context.Context, query string, limit int) ([]MemoryEntry, error)
 	SearchMemoryEntries(ctx context.Context, query MemorySearchQuery) ([]MemoryEntry, error)
@@ -93,6 +100,72 @@ type MemorySearchQuery struct {
 	Workspace      string
 	Kinds          []string
 	IncludeExpired bool
+}
+
+type AgentCheckpoint struct {
+	ID                  string
+	StreamID            string
+	TurnID              string
+	RunID               string
+	EventSeq            int64
+	WorkflowType        string
+	WorkflowPhase       string
+	Reason              string
+	ContextStateJSON    string
+	MemoryStateJSON     string
+	TokenStateJSON      string
+	ToolStateJSON       string
+	WorkspaceSnapshotID int64
+	ArtifactManifestID  string
+	CreatedAt           time.Time
+}
+
+type Artifact struct {
+	ID                string
+	StreamID          string
+	Workspace         string
+	Path              string
+	ArtifactType      string
+	CurrentVersionID  string
+	CreatedByEventSeq int64
+	CreatedBySpanID   string
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+}
+
+type ArtifactVersion struct {
+	ID                 string
+	ArtifactID         string
+	Version            int
+	StreamID           string
+	TurnID             string
+	RunID              string
+	Workspace          string
+	Path               string
+	ArtifactType       string
+	EventSeq           int64
+	ProducerSpanID     string
+	ProducerLLMCallID  string
+	ProducerToolCallID string
+	ContentHash        string
+	ContentBlob        string
+	SizeBytes          int64
+	SnapshotRef        string
+	DiffRef            string
+	Summary            string
+	CreatedAt          time.Time
+}
+
+type ArtifactDiff struct {
+	ID              string
+	StreamID        string
+	ArtifactID      string
+	BeforeVersionID string
+	AfterVersionID  string
+	DiffFormat      string
+	DiffText        string
+	Reversible      bool
+	CreatedAt       time.Time
 }
 
 type AppendEvent struct {
@@ -382,6 +455,281 @@ func (s *SQLiteStore) LatestProjectionSnapshot(streamID string) (ProjectionSnaps
 	return snapshot, nil
 }
 
+func (s *SQLiteStore) SaveAgentCheckpoint(ctx context.Context, checkpoint AgentCheckpoint) (AgentCheckpoint, error) {
+	if checkpoint.StreamID == "" {
+		return AgentCheckpoint{}, fmt.Errorf("stream_id is required")
+	}
+	if checkpoint.EventSeq <= 0 {
+		return AgentCheckpoint{}, fmt.Errorf("event_seq must be positive")
+	}
+	if strings.TrimSpace(checkpoint.Reason) == "" {
+		return AgentCheckpoint{}, fmt.Errorf("reason is required")
+	}
+	if checkpoint.ID == "" {
+		checkpoint.ID = fmt.Sprintf("ckpt:%s:%d:%s", checkpoint.StreamID, checkpoint.EventSeq, sanitizeIDPart(checkpoint.Reason))
+	}
+	checkpoint.ContextStateJSON = defaultJSON(checkpoint.ContextStateJSON)
+	checkpoint.MemoryStateJSON = defaultJSON(checkpoint.MemoryStateJSON)
+	checkpoint.TokenStateJSON = defaultJSON(checkpoint.TokenStateJSON)
+	checkpoint.ToolStateJSON = defaultJSON(checkpoint.ToolStateJSON)
+	_, err := s.Append(ctx, &WriteRequest{Statements: []WriteStatement{{
+		SQL: `INSERT INTO agent_checkpoints(
+				id, stream_id, turn_id, run_id, event_seq, workflow_type, workflow_phase, reason,
+				context_state_json, memory_state_json, token_state_json, tool_state_json,
+				workspace_snapshot_id, artifact_manifest_id
+			) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+			ON CONFLICT(id) DO UPDATE SET
+				context_state_json = excluded.context_state_json,
+				memory_state_json = excluded.memory_state_json,
+				token_state_json = excluded.token_state_json,
+				tool_state_json = excluded.tool_state_json,
+				workspace_snapshot_id = excluded.workspace_snapshot_id,
+				artifact_manifest_id = excluded.artifact_manifest_id`,
+		Args: []any{
+			checkpoint.ID,
+			checkpoint.StreamID,
+			checkpoint.TurnID,
+			checkpoint.RunID,
+			checkpoint.EventSeq,
+			checkpoint.WorkflowType,
+			checkpoint.WorkflowPhase,
+			checkpoint.Reason,
+			checkpoint.ContextStateJSON,
+			checkpoint.MemoryStateJSON,
+			checkpoint.TokenStateJSON,
+			checkpoint.ToolStateJSON,
+			nullableInt64(checkpoint.WorkspaceSnapshotID),
+			checkpoint.ArtifactManifestID,
+		},
+	}}})
+	if err != nil {
+		return AgentCheckpoint{}, err
+	}
+	checkpoint.CreatedAt = time.Now().UTC()
+	return checkpoint, nil
+}
+
+func (s *SQLiteStore) GetAgentCheckpoint(ctx context.Context, id string) (AgentCheckpoint, error) {
+	if strings.TrimSpace(id) == "" {
+		return AgentCheckpoint{}, fmt.Errorf("checkpoint id is required")
+	}
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, stream_id, turn_id, run_id, event_seq, workflow_type, workflow_phase, reason,
+		       context_state_json, memory_state_json, token_state_json, tool_state_json,
+		       workspace_snapshot_id, artifact_manifest_id, created_at
+		FROM agent_checkpoints
+		WHERE id = ?
+	`, id)
+	return scanAgentCheckpoint(row)
+}
+
+func (s *SQLiteStore) ListAgentCheckpoints(ctx context.Context, streamID string, limit int) ([]AgentCheckpoint, error) {
+	if strings.TrimSpace(streamID) == "" {
+		return nil, fmt.Errorf("stream_id is required")
+	}
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, stream_id, turn_id, run_id, event_seq, workflow_type, workflow_phase, reason,
+		       context_state_json, memory_state_json, token_state_json, tool_state_json,
+		       workspace_snapshot_id, artifact_manifest_id, created_at
+		FROM agent_checkpoints
+		WHERE stream_id = ?
+		ORDER BY event_seq DESC
+		LIMIT ?
+	`, streamID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	checkpoints := []AgentCheckpoint{}
+	for rows.Next() {
+		checkpoint, err := scanAgentCheckpoint(rows)
+		if err != nil {
+			return nil, err
+		}
+		checkpoints = append(checkpoints, checkpoint)
+	}
+	return checkpoints, rows.Err()
+}
+
+func (s *SQLiteStore) RecordArtifactVersion(ctx context.Context, version ArtifactVersion) (ArtifactVersion, error) {
+	if version.StreamID == "" {
+		return ArtifactVersion{}, fmt.Errorf("stream_id is required")
+	}
+	if strings.TrimSpace(version.Workspace) == "" {
+		return ArtifactVersion{}, fmt.Errorf("workspace is required")
+	}
+	if strings.TrimSpace(version.Path) == "" {
+		return ArtifactVersion{}, fmt.Errorf("path is required")
+	}
+	if strings.TrimSpace(version.ContentHash) == "" {
+		return ArtifactVersion{}, fmt.Errorf("content_hash is required")
+	}
+	if version.EventSeq <= 0 {
+		return ArtifactVersion{}, fmt.Errorf("event_seq must be positive")
+	}
+	if version.ArtifactType == "" {
+		version.ArtifactType = "file"
+	}
+	if version.ArtifactID == "" {
+		version.ArtifactID = fmt.Sprintf("artifact:%s:%s", version.StreamID, sanitizeIDPart(version.Path))
+	}
+	var currentMax sql.NullInt64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT MAX(version)
+		FROM artifact_versions
+		WHERE artifact_id = ?
+	`, version.ArtifactID).Scan(&currentMax)
+	if err != nil {
+		return ArtifactVersion{}, err
+	}
+	version.Version = int(currentMax.Int64) + 1
+	if version.ID == "" {
+		version.ID = fmt.Sprintf("%s:v%d", version.ArtifactID, version.Version)
+	}
+	var previousID, previousContent sql.NullString
+	_ = s.db.QueryRowContext(ctx, `
+		SELECT id, content_blob
+		FROM artifact_versions
+		WHERE artifact_id = ?
+		ORDER BY version DESC
+		LIMIT 1
+	`, version.ArtifactID).Scan(&previousID, &previousContent)
+	statements := []WriteStatement{
+		{
+			SQL: `INSERT INTO artifacts(id, stream_id, workspace, path, artifact_type, current_version_id, created_by_event_seq, created_by_span_id)
+				VALUES(?,?,?,?,?,?,?,?)
+				ON CONFLICT(stream_id, workspace, path) DO UPDATE SET
+					artifact_type = excluded.artifact_type,
+					current_version_id = excluded.current_version_id,
+					updated_at = datetime('now')`,
+			Args: []any{version.ArtifactID, version.StreamID, version.Workspace, version.Path, version.ArtifactType, version.ID, version.EventSeq, version.ProducerSpanID},
+		},
+		{
+			SQL: `INSERT INTO artifact_versions(
+					id, artifact_id, version, stream_id, turn_id, run_id, event_seq,
+					producer_span_id, producer_llm_call_id, producer_tool_call_id,
+					content_hash, content_blob, size_bytes, snapshot_ref, diff_ref, summary
+				) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			Args: []any{
+				version.ID,
+				version.ArtifactID,
+				version.Version,
+				version.StreamID,
+				version.TurnID,
+				version.RunID,
+				version.EventSeq,
+				version.ProducerSpanID,
+				version.ProducerLLMCallID,
+				version.ProducerToolCallID,
+				version.ContentHash,
+				version.ContentBlob,
+				version.SizeBytes,
+				version.SnapshotRef,
+				version.DiffRef,
+				version.Summary,
+			},
+		},
+	}
+	if previousID.Valid && previousContent.Valid && previousContent.String != version.ContentBlob {
+		diffID := fmt.Sprintf("diff:%s:v%d", version.ArtifactID, version.Version)
+		version.DiffRef = diffID
+		statements[1].Args[14] = version.DiffRef
+		statements = append(statements, WriteStatement{
+			SQL: `INSERT INTO artifact_diffs(id, stream_id, artifact_id, before_version_id, after_version_id, diff_format, diff_text, reversible)
+				VALUES(?,?,?,?,?,?,?,?)`,
+			Args: []any{diffID, version.StreamID, version.ArtifactID, previousID.String, version.ID, "simple", simpleTextDiff(previousContent.String, version.ContentBlob), 1},
+		})
+	}
+	_, err = s.Append(ctx, &WriteRequest{Statements: statements})
+	if err != nil {
+		return ArtifactVersion{}, err
+	}
+	version.CreatedAt = time.Now().UTC()
+	return version, nil
+}
+
+func (s *SQLiteStore) ListArtifacts(ctx context.Context, streamID string) ([]Artifact, error) {
+	if strings.TrimSpace(streamID) == "" {
+		return nil, fmt.Errorf("stream_id is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, stream_id, workspace, path, artifact_type, current_version_id, created_by_event_seq, created_by_span_id, created_at, updated_at
+		FROM artifacts
+		WHERE stream_id = ?
+		ORDER BY path ASC
+	`, streamID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	artifacts := []Artifact{}
+	for rows.Next() {
+		artifact, err := scanArtifact(rows)
+		if err != nil {
+			return nil, err
+		}
+		artifacts = append(artifacts, artifact)
+	}
+	return artifacts, rows.Err()
+}
+
+func (s *SQLiteStore) ListArtifactVersions(ctx context.Context, streamID string, path string) ([]ArtifactVersion, error) {
+	if strings.TrimSpace(streamID) == "" {
+		return nil, fmt.Errorf("stream_id is required")
+	}
+	if strings.TrimSpace(path) == "" {
+		return nil, fmt.Errorf("path is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT v.id, v.artifact_id, v.version, v.stream_id, v.turn_id, v.run_id,
+		       a.workspace, a.path, a.artifact_type, v.event_seq,
+		       v.producer_span_id, v.producer_llm_call_id, v.producer_tool_call_id,
+		       v.content_hash, v.content_blob, v.size_bytes, v.snapshot_ref, v.diff_ref, v.summary, v.created_at
+		FROM artifact_versions v
+		JOIN artifacts a ON a.id = v.artifact_id
+		WHERE v.stream_id = ? AND a.path = ?
+		ORDER BY v.version DESC
+	`, streamID, path)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	versions := []ArtifactVersion{}
+	for rows.Next() {
+		version, err := scanArtifactVersion(rows)
+		if err != nil {
+			return nil, err
+		}
+		versions = append(versions, version)
+	}
+	return versions, rows.Err()
+}
+
+func (s *SQLiteStore) GetArtifactVersion(ctx context.Context, streamID string, path string, versionNumber int) (ArtifactVersion, error) {
+	if strings.TrimSpace(streamID) == "" {
+		return ArtifactVersion{}, fmt.Errorf("stream_id is required")
+	}
+	if strings.TrimSpace(path) == "" {
+		return ArtifactVersion{}, fmt.Errorf("path is required")
+	}
+	if versionNumber <= 0 {
+		return ArtifactVersion{}, fmt.Errorf("version must be positive")
+	}
+	row := s.db.QueryRowContext(ctx, `
+		SELECT v.id, v.artifact_id, v.version, v.stream_id, v.turn_id, v.run_id,
+		       a.workspace, a.path, a.artifact_type, v.event_seq,
+		       v.producer_span_id, v.producer_llm_call_id, v.producer_tool_call_id,
+		       v.content_hash, v.content_blob, v.size_bytes, v.snapshot_ref, v.diff_ref, v.summary, v.created_at
+		FROM artifact_versions v
+		JOIN artifacts a ON a.id = v.artifact_id
+		WHERE v.stream_id = ? AND a.path = ? AND v.version = ?
+	`, streamID, path, versionNumber)
+	return scanArtifactVersion(row)
+}
+
 func (s *SQLiteStore) SaveMemoryEntry(ctx context.Context, entry MemoryEntry) (MemoryEntry, error) {
 	if entry.StreamID == "" {
 		return MemoryEntry{}, fmt.Errorf("stream_id is required")
@@ -491,6 +839,142 @@ func compactStrings(values []string) []string {
 		out = append(out, value)
 	}
 	return out
+}
+
+type checkpointScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanAgentCheckpoint(scanner checkpointScanner) (AgentCheckpoint, error) {
+	var checkpoint AgentCheckpoint
+	var workspaceSnapshotID sql.NullInt64
+	var createdAt string
+	err := scanner.Scan(
+		&checkpoint.ID,
+		&checkpoint.StreamID,
+		&checkpoint.TurnID,
+		&checkpoint.RunID,
+		&checkpoint.EventSeq,
+		&checkpoint.WorkflowType,
+		&checkpoint.WorkflowPhase,
+		&checkpoint.Reason,
+		&checkpoint.ContextStateJSON,
+		&checkpoint.MemoryStateJSON,
+		&checkpoint.TokenStateJSON,
+		&checkpoint.ToolStateJSON,
+		&workspaceSnapshotID,
+		&checkpoint.ArtifactManifestID,
+		&createdAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return AgentCheckpoint{}, sql.ErrNoRows
+	}
+	if err != nil {
+		return AgentCheckpoint{}, err
+	}
+	if workspaceSnapshotID.Valid {
+		checkpoint.WorkspaceSnapshotID = workspaceSnapshotID.Int64
+	}
+	checkpoint.CreatedAt = parseSQLiteTime(createdAt)
+	return checkpoint, nil
+}
+
+func scanArtifact(scanner checkpointScanner) (Artifact, error) {
+	var artifact Artifact
+	var currentVersionID sql.NullString
+	var createdBySpanID sql.NullString
+	var createdAt, updatedAt string
+	err := scanner.Scan(
+		&artifact.ID,
+		&artifact.StreamID,
+		&artifact.Workspace,
+		&artifact.Path,
+		&artifact.ArtifactType,
+		&currentVersionID,
+		&artifact.CreatedByEventSeq,
+		&createdBySpanID,
+		&createdAt,
+		&updatedAt,
+	)
+	if err != nil {
+		return Artifact{}, err
+	}
+	artifact.CurrentVersionID = currentVersionID.String
+	artifact.CreatedBySpanID = createdBySpanID.String
+	artifact.CreatedAt = parseSQLiteTime(createdAt)
+	artifact.UpdatedAt = parseSQLiteTime(updatedAt)
+	return artifact, nil
+}
+
+func scanArtifactVersion(scanner checkpointScanner) (ArtifactVersion, error) {
+	var version ArtifactVersion
+	var producerSpanID, producerLLMCallID, producerToolCallID sql.NullString
+	var contentBlob, snapshotRef, diffRef, summary sql.NullString
+	var createdAt string
+	err := scanner.Scan(
+		&version.ID,
+		&version.ArtifactID,
+		&version.Version,
+		&version.StreamID,
+		&version.TurnID,
+		&version.RunID,
+		&version.Workspace,
+		&version.Path,
+		&version.ArtifactType,
+		&version.EventSeq,
+		&producerSpanID,
+		&producerLLMCallID,
+		&producerToolCallID,
+		&version.ContentHash,
+		&contentBlob,
+		&version.SizeBytes,
+		&snapshotRef,
+		&diffRef,
+		&summary,
+		&createdAt,
+	)
+	if err != nil {
+		return ArtifactVersion{}, err
+	}
+	version.ProducerSpanID = producerSpanID.String
+	version.ProducerLLMCallID = producerLLMCallID.String
+	version.ProducerToolCallID = producerToolCallID.String
+	version.ContentBlob = contentBlob.String
+	version.SnapshotRef = snapshotRef.String
+	version.DiffRef = diffRef.String
+	version.Summary = summary.String
+	version.CreatedAt = parseSQLiteTime(createdAt)
+	return version, nil
+}
+
+func defaultJSON(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "{}"
+	}
+	return value
+}
+
+func sanitizeIDPart(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return "checkpoint"
+	}
+	replacer := strings.NewReplacer(" ", "_", "/", "_", ":", "_", "\t", "_", "\n", "_")
+	return replacer.Replace(value)
+}
+
+func nullableInt64(value int64) any {
+	if value == 0 {
+		return nil
+	}
+	return value
+}
+
+func simpleTextDiff(before, after string) string {
+	if before == after {
+		return ""
+	}
+	return "--- before\n" + before + "\n+++ after\n" + after
 }
 
 func estimateMemoryTokens(content string) int {

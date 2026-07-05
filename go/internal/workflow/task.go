@@ -153,6 +153,11 @@ func Execute(ctx context.Context, store storage.Store, registry *Registry, task 
 		}); err != nil {
 			return nil, err
 		}
+		if err := recordAgentCheckpoint(runCtx, wfctx, task, "run_started", map[string]any{
+			"tokens": map[string]any{"used": task.tokenUsed},
+		}); err != nil {
+			return nil, err
+		}
 	}
 	result, runErr := fn(runCtx, wfctx, task)
 	if errors.Is(runErr, ErrWorkflowSuspended) {
@@ -193,6 +198,11 @@ func Execute(ctx context.Context, store storage.Store, registry *Registry, task 
 			"final_answer": fmt.Sprint(result),
 			"result":       result,
 		})
+		if err := recordAgentCheckpoint(runCtx, wfctx, task, "run_completed", map[string]any{
+			"tokens": map[string]any{"used": task.tokenUsed},
+		}); err != nil {
+			return nil, err
+		}
 	}
 	if runErr == nil && wfctx.GetVersion("summary-memory", 2) >= 2 {
 		_ = wfctx.Record(runCtx, "SessionSummaryCreated", map[string]any{
@@ -312,6 +322,40 @@ func (task *TaskHandle) captureRunCheckpoint(ctx context.Context, store storage.
 			"snapshot_ref":   result.Snapshot.Ref,
 			"snapshot_seq":   result.Snapshot.StreamSeq,
 			"snapshot_event": result.Event.StreamSeq,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	checkpoint, err := store.SaveAgentCheckpoint(ctx, storage.AgentCheckpoint{
+		StreamID:            task.StreamID,
+		TurnID:              task.TurnID,
+		RunID:               task.RunID,
+		EventSeq:            result.Event.StreamSeq,
+		WorkflowType:        task.WorkflowType,
+		Reason:              "workspace_checkpoint",
+		WorkspaceSnapshotID: result.Snapshot.ID,
+		ContextStateJSON:    "{}",
+		MemoryStateJSON:     "{}",
+		TokenStateJSON:      "{}",
+		ToolStateJSON:       "{}",
+	})
+	if err != nil {
+		return err
+	}
+	_, err = store.AppendEvent(ctx, storage.AppendEvent{
+		StreamID:  task.StreamID,
+		EventType: "AgentCheckpointCreated",
+		Payload: map[string]any{
+			"checkpoint_id":         checkpoint.ID,
+			"stream_id":             checkpoint.StreamID,
+			"session_id":            task.SessionID,
+			"turn_id":               task.TurnID,
+			"run_id":                task.RunID,
+			"event_seq":             checkpoint.EventSeq,
+			"workflow_type":         checkpoint.WorkflowType,
+			"reason":                checkpoint.Reason,
+			"workspace_snapshot_id": checkpoint.WorkspaceSnapshotID,
 		},
 	})
 	return err

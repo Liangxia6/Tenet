@@ -18,7 +18,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import type React from "react";
 import { API_BASE, api, eventSourceURL } from "./api";
 import { buildTrace, parsePayload } from "./trace";
-import type { CreateTaskInput, StreamEvent, TaskListItem, TaskStatus, TaskView, TraceStep } from "./types";
+import type { AgentCheckpoint, Artifact, ArtifactVersion, CreateTaskInput, StreamEvent, TaskListItem, TaskStatus, TaskView, TraceStep, TraceView } from "./types";
 
 const workflows = ["auto", "simple", "react", "dag", "scientific", "coding", "interactive"];
 const workers = ["echo", "openai", "deepseek", "grpc"];
@@ -31,13 +31,18 @@ type ChatMessage = {
   eventType: string;
 };
 
-type InspectorTab = "trace" | "tools" | "events" | "tokens";
+type InspectorTab = "trace" | "checkpoints" | "artifacts" | "tools" | "events" | "tokens";
 
 export function App() {
   const [tasks, setTasks] = useState<TaskListItem[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [task, setTask] = useState<TaskView | null>(null);
   const [events, setEvents] = useState<StreamEvent[]>([]);
+  const [serverTrace, setServerTrace] = useState<TraceView | null>(null);
+  const [checkpoints, setCheckpoints] = useState<AgentCheckpoint[]>([]);
+  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  const [artifactVersions, setArtifactVersions] = useState<ArtifactVersion[]>([]);
+  const [selectedArtifactPath, setSelectedArtifactPath] = useState("");
   const [prompt, setPrompt] = useState("");
   const [worker, setWorker] = useState("echo");
   const [workflow, setWorkflow] = useState("auto");
@@ -62,11 +67,24 @@ export function App() {
     if (!streamId) {
       setTask(null);
       setEvents([]);
+      setServerTrace(null);
+      setCheckpoints([]);
+      setArtifacts([]);
+      setArtifactVersions([]);
       return;
     }
-    const [view, nextEvents] = await Promise.all([api.task(streamId), api.events(streamId, 1)]);
+    const [view, nextEvents, traceView, nextCheckpoints, nextArtifacts] = await Promise.all([
+      api.task(streamId),
+      api.events(streamId, 1),
+      api.trace(streamId),
+      api.checkpoints(streamId),
+      api.artifacts(streamId)
+    ]);
     setTask(view);
     setEvents(nextEvents);
+    setServerTrace(traceView);
+    setCheckpoints(nextCheckpoints);
+    setArtifacts(nextArtifacts);
     if (view.workspace) setWorkspace(view.workspace);
   }
 
@@ -108,6 +126,11 @@ export function App() {
     setSelectedId("");
     setTask(null);
     setEvents([]);
+    setServerTrace(null);
+    setCheckpoints([]);
+    setArtifacts([]);
+    setArtifactVersions([]);
+    setSelectedArtifactPath("");
     setPrompt("");
     setWorkflow("auto");
   }
@@ -167,6 +190,42 @@ export function App() {
       const fork = await api.fork(selectedId, seq, prompt || "forked session", true);
       await refreshTasks();
       setSelectedId(fork.stream_id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadArtifactVersions(path: string) {
+    if (!selectedId) return;
+    setSelectedArtifactPath(path);
+    const versions = await api.artifactVersions(selectedId, path);
+    setArtifactVersions(versions);
+  }
+
+  async function rollbackArtifact(path: string, version: number) {
+    if (!selectedId) return;
+    setLoading(true);
+    setError("");
+    try {
+      await api.rollbackArtifact(selectedId, path, version, workspace);
+      await refreshSession(selectedId);
+      await loadArtifactVersions(path);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function restoreCheckpoint(checkpointId: string) {
+    if (!selectedId) return;
+    setLoading(true);
+    setError("");
+    try {
+      await api.restoreCheckpoint(selectedId, checkpointId, workspace);
+      await refreshSession(selectedId);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -250,7 +309,21 @@ export function App() {
             )}
           </div>
           <div className="resizeHandle inspectorHandle" title="Resize inspector" onMouseDown={beginResize("inspector")} />
-          <Inspector tab={inspectorTab} setTab={setInspectorTab} trace={trace} events={events} task={task} />
+          <Inspector
+            tab={inspectorTab}
+            setTab={setInspectorTab}
+            trace={trace}
+            serverTrace={serverTrace}
+            events={events}
+            task={task}
+            checkpoints={checkpoints}
+            artifacts={artifacts}
+            artifactVersions={artifactVersions}
+            selectedArtifactPath={selectedArtifactPath}
+            onLoadArtifactVersions={(path) => loadArtifactVersions(path).catch((err) => setError(err.message))}
+            onRollbackArtifact={rollbackArtifact}
+            onRestoreCheckpoint={restoreCheckpoint}
+          />
         </section>
 
         <form className="chatComposer" onSubmit={submitPrompt}>
@@ -294,24 +367,50 @@ function Inspector({
   tab,
   setTab,
   trace,
+  serverTrace,
   events,
-  task
+  task,
+  checkpoints,
+  artifacts,
+  artifactVersions,
+  selectedArtifactPath,
+  onLoadArtifactVersions,
+  onRollbackArtifact,
+  onRestoreCheckpoint
 }: {
   tab: InspectorTab;
   setTab: (tab: InspectorTab) => void;
   trace: TraceStep[];
+  serverTrace: TraceView | null;
   events: StreamEvent[];
   task: TaskView | null;
+  checkpoints: AgentCheckpoint[];
+  artifacts: Artifact[];
+  artifactVersions: ArtifactVersion[];
+  selectedArtifactPath: string;
+  onLoadArtifactVersions: (path: string) => void;
+  onRollbackArtifact: (path: string, version: number) => void;
+  onRestoreCheckpoint: (checkpointId: string) => void;
 }) {
   const tools = events.filter((event) => event.event_type === "ToolExecuted");
   return (
     <aside className="agentInspector">
       <div className="inspectorTabs">
-        {(["trace", "tools", "events", "tokens"] as InspectorTab[]).map((item) => (
+        {(["trace", "checkpoints", "artifacts", "tools", "events", "tokens"] as InspectorTab[]).map((item) => (
           <button key={item} className={tab === item ? "active" : ""} onClick={() => setTab(item)}>{item}</button>
         ))}
       </div>
-      {tab === "trace" && <TracePanel trace={trace} />}
+      {tab === "trace" && <TracePanel trace={trace} serverTrace={serverTrace} />}
+      {tab === "checkpoints" && <CheckpointPanel checkpoints={checkpoints} onRestore={onRestoreCheckpoint} />}
+      {tab === "artifacts" && (
+        <ArtifactPanel
+          artifacts={artifacts}
+          versions={artifactVersions}
+          selectedPath={selectedArtifactPath}
+          onLoadVersions={onLoadArtifactVersions}
+          onRollback={onRollbackArtifact}
+        />
+      )}
       {tab === "tools" && <ToolPanel events={tools} />}
       {tab === "events" && <EventPanel events={events} />}
       {tab === "tokens" && <TokenPanel task={task} events={events} />}
@@ -319,7 +418,22 @@ function Inspector({
   );
 }
 
-function TracePanel({ trace }: { trace: TraceStep[] }) {
+function TracePanel({ trace, serverTrace }: { trace: TraceStep[]; serverTrace: TraceView | null }) {
+  if (serverTrace) {
+    const depths = traceDepths(serverTrace);
+    return (
+      <div className="inspectorScroll">
+        {serverTrace.spans.map((span) => (
+          <details key={span.id} className="traceLine" style={{ marginLeft: `${Math.min(depths[span.id] || 0, 5) * 10}px` }}>
+            <summary><span className={`dot ${span.type}`} /><span className="mono">#{span.started_seq}</span><strong>{span.type}</strong><em>{span.name}</em></summary>
+            <p>{span.status} {span.completed_seq ? `seq ${span.started_seq}..${span.completed_seq}` : `seq ${span.started_seq}`}</p>
+            {span.error && <p className="inlineError">{span.error}</p>}
+            <pre>{JSON.stringify(span.attributes || {}, null, 2)}</pre>
+          </details>
+        ))}
+      </div>
+    );
+  }
   return (
     <div className="inspectorScroll">
       {trace.map((step) => (
@@ -331,6 +445,78 @@ function TracePanel({ trace }: { trace: TraceStep[] }) {
       ))}
     </div>
   );
+}
+
+function CheckpointPanel({ checkpoints, onRestore }: { checkpoints: AgentCheckpoint[]; onRestore: (checkpointId: string) => void }) {
+  return (
+    <div className="inspectorScroll">
+      {checkpoints.length === 0 && <div className="empty">No checkpoints yet.</div>}
+      {checkpoints.map((checkpoint) => (
+        <div className="recordRow" key={checkpoint.ID}>
+          <div>
+            <strong>{checkpoint.Reason}</strong>
+            <span className="mono">seq {checkpoint.EventSeq} · {checkpoint.RunID || "run"}</span>
+          </div>
+          <button className="secondaryButton compact" disabled={!checkpoint.WorkspaceSnapshotID} onClick={() => onRestore(checkpoint.ID)}>Restore</button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ArtifactPanel({
+  artifacts,
+  versions,
+  selectedPath,
+  onLoadVersions,
+  onRollback
+}: {
+  artifacts: Artifact[];
+  versions: ArtifactVersion[];
+  selectedPath: string;
+  onLoadVersions: (path: string) => void;
+  onRollback: (path: string, version: number) => void;
+}) {
+  return (
+    <div className="inspectorScroll">
+      {artifacts.length === 0 && <div className="empty">No artifacts yet.</div>}
+      {artifacts.map((artifact) => (
+        <button className={`recordRow clickable ${selectedPath === artifact.Path ? "active" : ""}`} key={artifact.ID} onClick={() => onLoadVersions(artifact.Path)}>
+          <div>
+            <strong>{artifact.Path}</strong>
+            <span className="mono">{artifact.ArtifactType} · {artifact.CurrentVersionID || "no version"}</span>
+          </div>
+        </button>
+      ))}
+      {selectedPath && (
+        <div className="versionStack">
+          <h3>{selectedPath}</h3>
+          {versions.map((version) => (
+            <div className="versionRow" key={version.ID}>
+              <div>
+                <strong>v{version.Version}</strong>
+                <span className="mono">seq {version.EventSeq} · {version.ProducerToolCallID || "tool"} · {version.SizeBytes} bytes</span>
+              </div>
+              <button className="secondaryButton compact" onClick={() => onRollback(version.Path, version.Version)}>Rollback</button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function traceDepths(view: TraceView) {
+  const parents = new Map(view.spans.map((span) => [span.id, span.parent_id || ""]));
+  const depths: Record<string, number> = {};
+  const depthOf = (id: string): number => {
+    if (depths[id] != null) return depths[id];
+    const parent = parents.get(id);
+    if (!parent) return (depths[id] = 0);
+    return (depths[id] = depthOf(parent) + 1);
+  };
+  for (const span of view.spans) depthOf(span.id);
+  return depths;
 }
 
 function ToolPanel({ events }: { events: StreamEvent[] }) {
@@ -442,6 +628,14 @@ const tenetEventTypes = [
   "TaskResumeScheduled",
   "TaskResumed",
   "WorkspaceSnapshot",
+  "AgentCheckpointCreated",
+  "AgentCheckpointRestoreStarted",
+  "AgentCheckpointRestoreCompleted",
+  "AgentCheckpointRestoreFailed",
+  "ArtifactVersionCreated",
+  "ArtifactRollbackStarted",
+  "ArtifactRollbackCompleted",
+  "ArtifactRollbackFailed",
   "ForkCreated",
   "ForkWorkspaceInitialized",
   "ForkWorkspaceRestored",

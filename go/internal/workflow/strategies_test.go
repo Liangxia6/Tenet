@@ -505,6 +505,104 @@ func TestWorkflowRetrievesAndInjectsMemory(t *testing.T) {
 	}
 }
 
+func TestWorkflowCreatesAgentCheckpoints(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	store := testStore(t)
+	defer store.Close()
+	cfg := config.Default()
+	cfg.Workflow.RecordBatchSize = 20
+	if _, err := Execute(ctx, store, NewRegistry(), &TaskHandle{
+		StreamID:     "task:agent-checkpoints",
+		WorkflowType: "simple",
+		SessionID:    "task:agent-checkpoints",
+		Query:        "checkpoint test",
+		Workspace:    t.TempDir(),
+		Config:       cfg,
+		Client:       worker.StaticClient{Response: worker.GenerateThoughtResponse{Thought: "done", IsFinal: true}},
+	}); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	checkpoints, err := store.ListAgentCheckpoints(ctx, "task:agent-checkpoints", 20)
+	if err != nil {
+		t.Fatalf("ListAgentCheckpoints: %v", err)
+	}
+	reasons := map[string]bool{}
+	for _, checkpoint := range checkpoints {
+		reasons[checkpoint.Reason] = true
+	}
+	for _, want := range []string{"run_started", "llm_before_call", "run_completed"} {
+		if !reasons[want] {
+			t.Fatalf("missing checkpoint %s in %+v", want, checkpoints)
+		}
+	}
+	assertEvents(t, store, "task:agent-checkpoints", "AgentCheckpointCreated")
+	if _, err := Replay(ctx, store, NewRegistry(), &TaskHandle{StreamID: "task:agent-checkpoints", Config: cfg}); err != nil {
+		t.Fatalf("replay checkpoints: %v", err)
+	}
+}
+
+func TestWorkflowRecordsArtifactVersionsFromToolWrites(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	store := testStore(t)
+	defer store.Close()
+	workspace := t.TempDir()
+	generator := &scriptedGenerator{
+		responses: []worker.GenerateThoughtResponse{
+			{
+				Thought:      "write a file",
+				FinishReason: "tool_calls",
+				ToolCalls: []worker.ToolCall{{
+					CallID:    "call_write",
+					ToolName:  "write_file",
+					Arguments: `{"path":"src/main.go","content":"package main\n"}`,
+				}},
+			},
+			{
+				Thought:      "done",
+				IsFinal:      true,
+				FinishReason: "stop",
+			},
+		},
+	}
+	cfg := config.Default()
+	cfg.Agent.DefaultMaxSteps = 4
+	cfg.Agent.ConvergenceNoToolCalls = 1
+	cfg.Workflow.RecordBatchSize = 20
+	if _, err := Execute(ctx, store, NewRegistry(), &TaskHandle{
+		StreamID:     "task:artifact-write",
+		WorkflowType: "react",
+		SessionID:    "task:artifact-write",
+		Query:        "write main",
+		Workspace:    workspace,
+		SystemPrompt: "Use tools.",
+		Tools:        worker.BuiltinToolDefinitions(),
+		Config:       cfg,
+		Client:       worker.NewLocalAgentClient(generator, workspace, nil),
+	}); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	artifacts, err := store.ListArtifacts(ctx, "task:artifact-write")
+	if err != nil {
+		t.Fatalf("ListArtifacts: %v", err)
+	}
+	if len(artifacts) != 1 || artifacts[0].Path != "src/main.go" || artifacts[0].ArtifactType != "code" {
+		t.Fatalf("artifacts = %+v", artifacts)
+	}
+	versions, err := store.ListArtifactVersions(ctx, "task:artifact-write", "src/main.go")
+	if err != nil {
+		t.Fatalf("ListArtifactVersions: %v", err)
+	}
+	if len(versions) != 1 || versions[0].ProducerToolCallID != "call_write" || versions[0].ContentHash == "" {
+		t.Fatalf("versions = %+v", versions)
+	}
+	assertEvents(t, store, "task:artifact-write", "ArtifactVersionCreated")
+	if _, err := Replay(ctx, store, NewRegistry(), &TaskHandle{StreamID: "task:artifact-write", Config: cfg}); err != nil {
+		t.Fatalf("replay artifact write: %v", err)
+	}
+}
+
 func TestReactWorkflowValidatesAndPassesFencingTokenToTool(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

@@ -381,3 +381,121 @@ func TestSQLiteStoreMemoryFTS(t *testing.T) {
 		t.Fatalf("missing = %+v", missing)
 	}
 }
+
+func TestSQLiteStoreAgentCheckpoints(t *testing.T) {
+	db := setupDB(t)
+	store := NewSQLiteStore(db, SQLiteOptions{QueueSize: 8})
+	defer store.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	first, err := store.SaveAgentCheckpoint(ctx, AgentCheckpoint{
+		StreamID:         "task:checkpoint",
+		TurnID:           "turn:1",
+		RunID:            "run:1",
+		EventSeq:         3,
+		WorkflowType:     "coding",
+		WorkflowPhase:    "edit",
+		Reason:           "tool_before_call",
+		ContextStateJSON: `{"tokens":20}`,
+		MemoryStateJSON:  `{"refs":["mem:1"]}`,
+		TokenStateJSON:   `{"total":10}`,
+		ToolStateJSON:    `{"tool":"write_file"}`,
+	})
+	if err != nil {
+		t.Fatalf("SaveAgentCheckpoint first: %v", err)
+	}
+	if first.ID == "" {
+		t.Fatalf("checkpoint id not generated: %+v", first)
+	}
+	if _, err := store.SaveAgentCheckpoint(ctx, AgentCheckpoint{
+		ID:       "ckpt:manual",
+		StreamID: "task:checkpoint",
+		EventSeq: 8,
+		Reason:   "manual",
+	}); err != nil {
+		t.Fatalf("SaveAgentCheckpoint second: %v", err)
+	}
+	loaded, err := store.GetAgentCheckpoint(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("GetAgentCheckpoint: %v", err)
+	}
+	if loaded.WorkflowType != "coding" || loaded.WorkflowPhase != "edit" || loaded.ContextStateJSON == "" {
+		t.Fatalf("loaded = %+v", loaded)
+	}
+	list, err := store.ListAgentCheckpoints(ctx, "task:checkpoint", 10)
+	if err != nil {
+		t.Fatalf("ListAgentCheckpoints: %v", err)
+	}
+	if len(list) != 2 || list[0].ID != "ckpt:manual" || list[1].ID != first.ID {
+		t.Fatalf("list = %+v", list)
+	}
+}
+
+func TestSQLiteStoreArtifactVersions(t *testing.T) {
+	db := setupDB(t)
+	store := NewSQLiteStore(db, SQLiteOptions{QueueSize: 8})
+	defer store.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	first, err := store.RecordArtifactVersion(ctx, ArtifactVersion{
+		StreamID:           "task:artifact",
+		TurnID:             "turn:1",
+		RunID:              "run:1",
+		Workspace:          "/tmp/work",
+		Path:               "src/main.go",
+		ArtifactType:       "code",
+		EventSeq:           4,
+		ProducerToolCallID: "tool:1",
+		ContentHash:        "sha256:first",
+		ContentBlob:        "package main\n",
+		SizeBytes:          12,
+		Summary:            "initial version",
+	})
+	if err != nil {
+		t.Fatalf("RecordArtifactVersion first: %v", err)
+	}
+	second, err := store.RecordArtifactVersion(ctx, ArtifactVersion{
+		StreamID:           "task:artifact",
+		TurnID:             "turn:1",
+		RunID:              "run:1",
+		Workspace:          "/tmp/work",
+		Path:               "src/main.go",
+		ArtifactType:       "code",
+		EventSeq:           8,
+		ProducerToolCallID: "tool:2",
+		ContentHash:        "sha256:second",
+		ContentBlob:        "package main\nfunc main() {}\n",
+		SizeBytes:          18,
+		Summary:            "second version",
+	})
+	if err != nil {
+		t.Fatalf("RecordArtifactVersion second: %v", err)
+	}
+	if first.Version != 1 || second.Version != 2 || first.ArtifactID != second.ArtifactID {
+		t.Fatalf("versions first=%+v second=%+v", first, second)
+	}
+	artifacts, err := store.ListArtifacts(ctx, "task:artifact")
+	if err != nil {
+		t.Fatalf("ListArtifacts: %v", err)
+	}
+	if len(artifacts) != 1 || artifacts[0].CurrentVersionID != second.ID {
+		t.Fatalf("artifacts = %+v", artifacts)
+	}
+	versions, err := store.ListArtifactVersions(ctx, "task:artifact", "src/main.go")
+	if err != nil {
+		t.Fatalf("ListArtifactVersions: %v", err)
+	}
+	if len(versions) != 2 || versions[0].Version != 2 || versions[1].Version != 1 {
+		t.Fatalf("versions = %+v", versions)
+	}
+	if versions[0].ContentBlob == "" || versions[0].DiffRef == "" {
+		t.Fatalf("version content/diff = %+v", versions[0])
+	}
+	loaded, err := store.GetArtifactVersion(ctx, "task:artifact", "src/main.go", 1)
+	if err != nil {
+		t.Fatalf("GetArtifactVersion: %v", err)
+	}
+	if loaded.Version != 1 || loaded.ContentBlob != "package main\n" {
+		t.Fatalf("loaded = %+v", loaded)
+	}
+}

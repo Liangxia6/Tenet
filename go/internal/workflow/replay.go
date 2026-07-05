@@ -111,6 +111,9 @@ func Replay(ctx context.Context, store storage.Store, registry *Registry, task *
 		}); err != nil {
 			return nil, err
 		}
+		if err := recordAgentCheckpoint(ctx, wfctx, task, "run_started", nil); err != nil {
+			return nil, err
+		}
 	}
 	result, runErr := fn(ctx, wfctx, task)
 	if errors.Is(runErr, ErrWorkflowSuspended) {
@@ -159,6 +162,9 @@ func Replay(ctx context.Context, store storage.Store, registry *Registry, task *
 			"final_answer": fmt.Sprint(result),
 			"result":       result,
 		}); err != nil {
+			return nil, err
+		}
+		if err := recordAgentCheckpoint(ctx, wfctx, task, "run_completed", nil); err != nil {
 			return nil, err
 		}
 	}
@@ -292,7 +298,7 @@ func buildReplaySpec(task *TaskHandle, events []storage.Event) (replaySpec, erro
 
 func postRunReplayEvent(eventType string) bool {
 	switch eventType {
-	case "VersionMarker", "SessionSummaryCreated", "WorkspaceSummaryCreated":
+	case "VersionMarker", "AgentCheckpointCreated", "SessionSummaryCreated", "WorkspaceSummaryCreated":
 		return true
 	default:
 		return false

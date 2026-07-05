@@ -56,6 +56,79 @@ export type TaskView = {
   tokens: TokenState;
 };
 
+export type TraceView = {
+  stream_id: string;
+  root_span_id?: string;
+  spans: TraceSpan[];
+  edges?: { from: string; to: string; type: string }[];
+  artifacts?: { artifact_id: string; version_id?: string; path?: string; span_id?: string; event_seq?: number }[];
+  checkpoints?: { checkpoint_id?: string; span_id?: string; event_seq?: number; reason?: string; snapshot_ref?: string }[];
+};
+
+export type TraceSpan = {
+  id: string;
+  parent_id?: string;
+  stream_id: string;
+  session_id?: string;
+  turn_id?: string;
+  run_id?: string;
+  type: string;
+  name: string;
+  status: TaskStatus;
+  started_seq: number;
+  completed_seq?: number;
+  error?: string;
+  attributes?: Record<string, unknown>;
+};
+
+export type AgentCheckpoint = {
+  ID: string;
+  StreamID: string;
+  TurnID?: string;
+  RunID?: string;
+  EventSeq: number;
+  WorkflowType?: string;
+  WorkflowPhase?: string;
+  Reason: string;
+  WorkspaceSnapshotID?: number;
+  CreatedAt?: string;
+};
+
+export type Artifact = {
+  ID: string;
+  StreamID: string;
+  Workspace: string;
+  Path: string;
+  ArtifactType: string;
+  CurrentVersionID?: string;
+  CreatedByEventSeq: number;
+};
+
+export type ArtifactVersion = {
+  ID: string;
+  ArtifactID: string;
+  Version: number;
+  StreamID: string;
+  Workspace: string;
+  Path: string;
+  ArtifactType: string;
+  EventSeq: number;
+  ProducerToolCallID?: string;
+  ContentHash: string;
+  SizeBytes: number;
+  DiffRef?: string;
+  Summary?: string;
+};
+
+export type RestoreResponse = {
+  stream_id: string;
+  checkpoint_id: string;
+  workspace: string;
+  snapshot_type: string;
+  snapshot_ref: string;
+  snapshot_seq: number;
+};
+
 export type TaskListItem = {
   stream_id: string;
   status: TaskStatus;

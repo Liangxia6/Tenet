@@ -72,6 +72,34 @@ func (r *Router) LatestProjectionSnapshot(streamID string) (storage.ProjectionSn
 	return r.state.LatestProjectionSnapshot(streamID)
 }
 
+func (r *Router) SaveAgentCheckpoint(ctx context.Context, checkpoint storage.AgentCheckpoint) (storage.AgentCheckpoint, error) {
+	return r.state.SaveAgentCheckpoint(ctx, checkpoint)
+}
+
+func (r *Router) GetAgentCheckpoint(ctx context.Context, id string) (storage.AgentCheckpoint, error) {
+	return r.state.GetAgentCheckpoint(ctx, id)
+}
+
+func (r *Router) ListAgentCheckpoints(ctx context.Context, streamID string, limit int) ([]storage.AgentCheckpoint, error) {
+	return r.state.ListAgentCheckpoints(ctx, streamID, limit)
+}
+
+func (r *Router) RecordArtifactVersion(ctx context.Context, version storage.ArtifactVersion) (storage.ArtifactVersion, error) {
+	return r.state.RecordArtifactVersion(ctx, version)
+}
+
+func (r *Router) ListArtifacts(ctx context.Context, streamID string) ([]storage.Artifact, error) {
+	return r.state.ListArtifacts(ctx, streamID)
+}
+
+func (r *Router) ListArtifactVersions(ctx context.Context, streamID string, path string) ([]storage.ArtifactVersion, error) {
+	return r.state.ListArtifactVersions(ctx, streamID, path)
+}
+
+func (r *Router) GetArtifactVersion(ctx context.Context, streamID string, path string, version int) (storage.ArtifactVersion, error) {
+	return r.state.GetArtifactVersion(ctx, streamID, path, version)
+}
+
 func (r *Router) SaveMemoryEntry(ctx context.Context, entry storage.MemoryEntry) (storage.MemoryEntry, error) {
 	return r.state.SaveMemoryEntry(ctx, entry)
 }

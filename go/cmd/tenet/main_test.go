@@ -18,6 +18,7 @@ import (
 	"github.com/tenet/orchestrator/internal/config"
 	"github.com/tenet/orchestrator/internal/storage"
 	"github.com/tenet/orchestrator/internal/worker"
+	workspacepkg "github.com/tenet/orchestrator/internal/workspace"
 )
 
 func TestBuildTaskClientDeepSeekDefaults(t *testing.T) {
@@ -176,6 +177,31 @@ func TestHTTPAPITaskLifecycle(t *testing.T) {
 	if len(events) == 0 {
 		t.Fatalf("expected events")
 	}
+	traceResp, err := http.Get(server.URL + "/tasks/" + url.PathEscape(taskID) + "/trace")
+	if err != nil {
+		t.Fatalf("get trace: %v", err)
+	}
+	var trace map[string]any
+	if err := json.NewDecoder(traceResp.Body).Decode(&trace); err != nil {
+		t.Fatalf("decode trace: %v", err)
+	}
+	_ = traceResp.Body.Close()
+	spans, _ := trace["spans"].([]any)
+	if trace["root_span_id"] == "" || len(spans) == 0 {
+		t.Fatalf("trace = %+v", trace)
+	}
+	checkpointResp, err := http.Get(server.URL + "/tasks/" + url.PathEscape(taskID) + "/checkpoints")
+	if err != nil {
+		t.Fatalf("get checkpoints: %v", err)
+	}
+	var checkpoints []map[string]any
+	if err := json.NewDecoder(checkpointResp.Body).Decode(&checkpoints); err != nil {
+		t.Fatalf("decode checkpoints: %v", err)
+	}
+	_ = checkpointResp.Body.Close()
+	if len(checkpoints) == 0 {
+		t.Fatalf("expected checkpoints")
+	}
 	counts := map[string]int{}
 	for _, event := range events {
 		eventType, _ := event["event_type"].(string)
@@ -203,6 +229,117 @@ func TestHTTPAPITaskLifecycle(t *testing.T) {
 	_ = forkResp.Body.Close()
 	if fork["stream_id"] == "" {
 		t.Fatalf("fork = %+v", fork)
+	}
+}
+
+func TestArtifactRollbackHelper(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.Database.Path = filepath.Join(t.TempDir(), "tenet.db")
+	store, err := storage.Open(cfg.Database.Path, storage.SQLiteOptions{QueueSize: 16})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+	workspace := t.TempDir()
+	if _, err := store.RecordArtifactVersion(ctx, storage.ArtifactVersion{
+		StreamID:     "task:rollback",
+		Workspace:    workspace,
+		Path:         "src/main.go",
+		ArtifactType: "code",
+		EventSeq:     1,
+		ContentHash:  "sha256:v1",
+		ContentBlob:  "package main\n",
+		SizeBytes:    int64(len("package main\n")),
+	}); err != nil {
+		t.Fatalf("record v1: %v", err)
+	}
+	if _, err := store.RecordArtifactVersion(ctx, storage.ArtifactVersion{
+		StreamID:     "task:rollback",
+		Workspace:    workspace,
+		Path:         "src/main.go",
+		ArtifactType: "code",
+		EventSeq:     2,
+		ContentHash:  "sha256:v2",
+		ContentBlob:  "package main\nfunc main() {}\n",
+		SizeBytes:    int64(len("package main\nfunc main() {}\n")),
+	}); err != nil {
+		t.Fatalf("record v2: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(workspace, "src"), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "src/main.go"), []byte("package main\nfunc main() {}\n"), 0644); err != nil {
+		t.Fatalf("write current: %v", err)
+	}
+	result, err := rollbackArtifact(ctx, store, "task:rollback", "src/main.go", 1, "")
+	if err != nil {
+		t.Fatalf("rollbackArtifact: %v", err)
+	}
+	if result.Version != 3 {
+		t.Fatalf("result = %+v", result)
+	}
+	data, err := os.ReadFile(filepath.Join(workspace, "src/main.go"))
+	if err != nil {
+		t.Fatalf("read rolled back: %v", err)
+	}
+	if string(data) != "package main\n" {
+		t.Fatalf("content = %q", string(data))
+	}
+	versions, err := store.ListArtifactVersions(ctx, "task:rollback", "src/main.go")
+	if err != nil {
+		t.Fatalf("versions: %v", err)
+	}
+	if len(versions) != 3 || versions[0].ProducerToolCallID != "rollback" {
+		t.Fatalf("versions = %+v", versions)
+	}
+}
+
+func TestRestoreCheckpointHelper(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.Default()
+	cfg.Database.Path = filepath.Join(t.TempDir(), "tenet.db")
+	cfg.Workspace.BasePath = t.TempDir()
+	cfg.Workspace.SnapshotDriver = "archive"
+	store, err := storage.Open(cfg.Database.Path, storage.SQLiteOptions{QueueSize: 16})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer store.Close()
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "README.md"), []byte("before"), 0644); err != nil {
+		t.Fatalf("write before: %v", err)
+	}
+	captured, err := workspacepkg.NewManager(cfg).CaptureSnapshot(ctx, store, "task:restore", workspace, "task:restore", 1, map[string]any{"checkpoint": "manual"}, nil, zeroFencingLease())
+	if err != nil {
+		t.Fatalf("CaptureSnapshot: %v", err)
+	}
+	checkpoint, err := store.SaveAgentCheckpoint(ctx, storage.AgentCheckpoint{
+		ID:                  "ckpt:restore",
+		StreamID:            "task:restore",
+		EventSeq:            captured.Event.StreamSeq,
+		Reason:              "manual",
+		WorkspaceSnapshotID: captured.Snapshot.ID,
+	})
+	if err != nil {
+		t.Fatalf("SaveAgentCheckpoint: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "README.md"), []byte("after"), 0644); err != nil {
+		t.Fatalf("write after: %v", err)
+	}
+	result, err := restoreCheckpoint(ctx, store, cfg, "task:restore", checkpoint.ID, workspace)
+	if err != nil {
+		t.Fatalf("restoreCheckpoint: %v", err)
+	}
+	if result.SnapshotRef == "" {
+		t.Fatalf("result = %+v", result)
+	}
+	data, err := os.ReadFile(filepath.Join(workspace, "README.md"))
+	if err != nil {
+		t.Fatalf("read restored: %v", err)
+	}
+	if string(data) != "before" {
+		t.Fatalf("restored content = %q", string(data))
 	}
 }
 

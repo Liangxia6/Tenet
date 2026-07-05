@@ -3,9 +3,14 @@ import type {
   CreateTaskResponse,
   ForkResponse,
   LineageResponse,
+  AgentCheckpoint,
+  Artifact,
+  ArtifactVersion,
+  RestoreResponse,
   StreamEvent,
   TaskListItem,
   TaskView,
+  TraceView,
   WorkerInfo
 } from "./types";
 
@@ -45,6 +50,21 @@ export const api = {
   task: (streamId: string) => request<TaskView>(`/tasks/${encodeURIComponent(streamId)}`),
   events: (streamId: string, from = 1) =>
     request<StreamEvent[]>(`/tasks/${encodeURIComponent(streamId)}/events?from=${from}`),
+  trace: (streamId: string) => request<TraceView>(`/tasks/${encodeURIComponent(streamId)}/trace`),
+  checkpoints: (streamId: string) => request<AgentCheckpoint[]>(`/tasks/${encodeURIComponent(streamId)}/checkpoints`),
+  artifacts: (streamId: string) => request<Artifact[]>(`/tasks/${encodeURIComponent(streamId)}/artifacts`),
+  artifactVersions: (streamId: string, path: string) =>
+    request<ArtifactVersion[]>(`/tasks/${encodeURIComponent(streamId)}/artifacts?path=${encodeURIComponent(path)}`),
+  rollbackArtifact: (streamId: string, path: string, version: number, workspace: string) =>
+    request<unknown>(`/tasks/${encodeURIComponent(streamId)}/artifacts`, {
+      method: "POST",
+      body: JSON.stringify({ action: "rollback", path, version, workspace })
+    }),
+  restoreCheckpoint: (streamId: string, checkpointId: string, workspace: string) =>
+    request<RestoreResponse>(`/tasks/${encodeURIComponent(streamId)}/restore`, {
+      method: "POST",
+      body: JSON.stringify({ checkpoint_id: checkpointId, workspace })
+    }),
   cancel: (streamId: string, reason: string) =>
     request<StreamEvent>(`/tasks/${encodeURIComponent(streamId)}/cancel`, {
       method: "POST",

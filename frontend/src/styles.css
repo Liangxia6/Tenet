@@ -372,6 +372,77 @@ pre { margin: 0; white-space: pre-wrap; word-break: break-word; }
 .dot.workspace { background: #16a34a; }
 .dot.fork { background: #c026d3; }
 .dot.status { background: #2563eb; }
+.dot.run, .dot.workflow_phase { background: #0f766e; }
+.dot.context_assembly, .dot.memory_retrieval { background: #4f46e5; }
+.dot.checkpoint, .dot.checkpoint_restore { background: #0891b2; }
+.dot.artifact, .dot.artifact_rollback { background: #be123c; }
+
+.traceLine summary em {
+  color: #6b7280;
+  font-size: 12px;
+  font-style: normal;
+  margin-left: auto;
+}
+
+.inlineError {
+  color: #be123c !important;
+}
+
+.recordRow, .versionRow {
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  background: #fff;
+  padding: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: #111827;
+  text-align: left;
+  width: 100%;
+}
+
+.recordRow.active, .recordRow.clickable:hover {
+  background: #f3f4f6;
+}
+
+.recordRow div, .versionRow div {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
+.recordRow strong, .versionRow strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recordRow .mono, .versionRow .mono {
+  color: #6b7280;
+}
+
+.secondaryButton.compact {
+  min-height: 30px;
+  padding: 0 9px;
+  font-size: 12px;
+}
+
+.versionStack {
+  display: grid;
+  gap: 8px;
+  border-top: 1px solid #e5e7eb;
+  padding-top: 12px;
+  margin-top: 2px;
+}
+
+.versionStack h3 {
+  font-size: 13px;
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .metricGrid {
   display: grid;

@@ -80,6 +80,67 @@ func InitSchema(db *sql.DB) error {
 			expires_at TEXT,
 			created_at TEXT NOT NULL DEFAULT (datetime('now'))
 		)`,
+		`CREATE TABLE IF NOT EXISTS agent_checkpoints (
+			id TEXT PRIMARY KEY,
+			stream_id TEXT NOT NULL,
+			turn_id TEXT,
+			run_id TEXT,
+			event_seq INTEGER NOT NULL,
+			workflow_type TEXT,
+			workflow_phase TEXT,
+			reason TEXT NOT NULL,
+			context_state_json TEXT NOT NULL DEFAULT '{}',
+			memory_state_json TEXT NOT NULL DEFAULT '{}',
+			token_state_json TEXT NOT NULL DEFAULT '{}',
+			tool_state_json TEXT NOT NULL DEFAULT '{}',
+			workspace_snapshot_id INTEGER,
+			artifact_manifest_id TEXT,
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		)`,
+		`CREATE TABLE IF NOT EXISTS artifacts (
+			id TEXT PRIMARY KEY,
+			stream_id TEXT NOT NULL,
+			workspace TEXT NOT NULL,
+			path TEXT NOT NULL,
+			artifact_type TEXT NOT NULL,
+			current_version_id TEXT,
+			created_by_event_seq INTEGER NOT NULL,
+			created_by_span_id TEXT,
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+			UNIQUE(stream_id, workspace, path)
+		)`,
+		`CREATE TABLE IF NOT EXISTS artifact_versions (
+			id TEXT PRIMARY KEY,
+			artifact_id TEXT NOT NULL,
+			version INTEGER NOT NULL,
+			stream_id TEXT NOT NULL,
+			turn_id TEXT,
+			run_id TEXT,
+			event_seq INTEGER NOT NULL,
+			producer_span_id TEXT,
+			producer_llm_call_id TEXT,
+			producer_tool_call_id TEXT,
+			content_hash TEXT NOT NULL,
+			content_blob TEXT,
+			size_bytes INTEGER NOT NULL DEFAULT 0,
+			snapshot_ref TEXT,
+			diff_ref TEXT,
+			summary TEXT,
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			FOREIGN KEY(artifact_id) REFERENCES artifacts(id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS artifact_diffs (
+			id TEXT PRIMARY KEY,
+			stream_id TEXT NOT NULL,
+			artifact_id TEXT NOT NULL,
+			before_version_id TEXT,
+			after_version_id TEXT NOT NULL,
+			diff_format TEXT NOT NULL,
+			diff_text TEXT NOT NULL,
+			reversible INTEGER NOT NULL DEFAULT 1,
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		)`,
 		`CREATE VIRTUAL TABLE IF NOT EXISTS memory_entries_fts USING fts5(
 			content,
 			kind UNINDEXED,
@@ -100,6 +161,11 @@ func InitSchema(db *sql.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_memory_entries_stream ON memory_entries(stream_id, created_at DESC)",
 		"CREATE INDEX IF NOT EXISTS idx_memory_entries_kind ON memory_entries(kind, created_at DESC)",
 		"CREATE INDEX IF NOT EXISTS idx_memory_entries_workspace ON memory_entries(workspace, created_at DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_agent_checkpoints_stream ON agent_checkpoints(stream_id, event_seq DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_agent_checkpoints_run ON agent_checkpoints(run_id, event_seq DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_artifacts_stream ON artifacts(stream_id, path)",
+		"CREATE INDEX IF NOT EXISTS idx_artifact_versions_artifact ON artifact_versions(artifact_id, version DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_artifact_versions_stream ON artifact_versions(stream_id, event_seq DESC)",
 	}
 	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {
@@ -109,8 +175,24 @@ func InitSchema(db *sql.DB) error {
 	if err := ensureMemoryEntryColumns(db); err != nil {
 		return err
 	}
+	if err := ensureArtifactVersionColumns(db); err != nil {
+		return err
+	}
 	if _, err := db.Exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)", CurrentSchemaVersion); err != nil {
 		return fmt.Errorf("record schema migration: %w", err)
+	}
+	return nil
+}
+
+func ensureArtifactVersionColumns(db *sql.DB) error {
+	columns, err := tableColumns(db, "artifact_versions")
+	if err != nil {
+		return err
+	}
+	if !columns["content_blob"] {
+		if _, err := db.Exec("ALTER TABLE artifact_versions ADD COLUMN content_blob TEXT"); err != nil {
+			return fmt.Errorf("add artifact_versions.content_blob: %w", err)
+		}
 	}
 	return nil
 }

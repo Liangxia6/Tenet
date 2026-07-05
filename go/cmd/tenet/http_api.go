@@ -44,8 +44,17 @@ type taskActionRequest struct {
 	Note             string `json:"note"`
 	After            string `json:"after"`
 	Query            string `json:"query"`
+	CheckpointID     string `json:"checkpoint_id"`
+	Workspace        string `json:"workspace"`
 	Seq              int64  `json:"seq"`
 	RestoreWorkspace *bool  `json:"restore_workspace"`
+}
+
+type artifactActionRequest struct {
+	Action    string `json:"action"`
+	Path      string `json:"path"`
+	Version   int    `json:"version"`
+	Workspace string `json:"workspace"`
 }
 
 type workspaceSnapshotRequest struct {
@@ -352,6 +361,57 @@ func handleHTTPTaskRoute(w http.ResponseWriter, r *http.Request, store storage.S
 			out = append(out, eventrouter.FromStorageEvent(event))
 		}
 		writeJSON(w, http.StatusOK, out)
+	case action == "trace" && r.Method == http.MethodGet:
+		view, err := projection.NewEngine(store, cfg).ProjectTrace(r.Context(), streamID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, view)
+	case action == "checkpoints" && r.Method == http.MethodGet:
+		limit := 100
+		if raw := r.URL.Query().Get("limit"); raw != "" {
+			if parsed, err := strconv.Atoi(raw); err == nil {
+				limit = parsed
+			}
+		}
+		checkpoints, err := store.ListAgentCheckpoints(r.Context(), streamID, limit)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, checkpoints)
+	case action == "artifacts" && r.Method == http.MethodGet:
+		if path := r.URL.Query().Get("path"); path != "" {
+			versions, err := store.ListArtifactVersions(r.Context(), streamID, path)
+			if err != nil {
+				writeError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusOK, versions)
+			return
+		}
+		artifacts, err := store.ListArtifacts(r.Context(), streamID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, artifacts)
+	case action == "artifacts" && r.Method == http.MethodPost:
+		var req artifactActionRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		if req.Action != "rollback" {
+			writeAPIError(w, http.StatusBadRequest, "BAD_REQUEST", "unsupported artifact action")
+			return
+		}
+		result, err := rollbackArtifact(r.Context(), store, streamID, req.Path, req.Version, req.Workspace)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
 	case action == "cancel" && r.Method == http.MethodPost:
 		var req taskActionRequest
 		if !decodeJSON(w, r, &req) {
@@ -365,6 +425,17 @@ func handleHTTPTaskRoute(w http.ResponseWriter, r *http.Request, store storage.S
 		writeJSON(w, http.StatusOK, eventrouter.FromStorageEvent(event))
 	case action == "resume" && r.Method == http.MethodPost:
 		handleHTTPTaskResume(w, r, store, streamID)
+	case action == "restore" && r.Method == http.MethodPost:
+		var req taskActionRequest
+		if !decodeJSON(w, r, &req) {
+			return
+		}
+		result, err := restoreCheckpoint(r.Context(), store, cfg, streamID, req.CheckpointID, req.Workspace)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
 	case action == "messages" && r.Method == http.MethodPost:
 		handleHTTPTaskMessage(w, r, store, cfg, streamID)
 	case action == "fork" && r.Method == http.MethodPost:
@@ -566,8 +637,20 @@ func handleHTTPTaskFork(w http.ResponseWriter, r *http.Request, store storage.St
 	if !decodeJSON(w, r, &req) {
 		return
 	}
+	if req.CheckpointID != "" {
+		checkpoint, err := store.GetAgentCheckpoint(r.Context(), req.CheckpointID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		if checkpoint.StreamID != streamID {
+			writeAPIError(w, http.StatusBadRequest, "BAD_REQUEST", "checkpoint belongs to another stream")
+			return
+		}
+		req.Seq = checkpoint.EventSeq
+	}
 	if req.Seq <= 0 {
-		writeAPIError(w, http.StatusBadRequest, "BAD_REQUEST", "seq must be positive")
+		writeAPIError(w, http.StatusBadRequest, "BAD_REQUEST", "seq or checkpoint_id must be positive")
 		return
 	}
 	restoreWorkspace := true
