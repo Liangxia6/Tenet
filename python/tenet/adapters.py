@@ -121,6 +121,12 @@ class DeepSeekAdapter(OpenAICompatibleAdapter):
 
 
 class ProviderRouter:
+    """根据环境变量选择 LLM provider。
+
+    默认 echo 方便无 key 测试；OpenAI/DeepSeek 都走 OpenAI-compatible chat completions 协议。
+    Go CLI 的 --worker openai/deepseek 和 Python Worker 的 provider 设计保持一致。
+    """
+
     def __init__(self, adapter: LLMAdapter) -> None:
         self.adapter = adapter
 
@@ -221,4 +227,3 @@ def _http_json_post(url: str, headers: dict[str, str], payload: dict[str, Any]) 
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"LLM provider HTTP {exc.code}: {body}") from exc
-

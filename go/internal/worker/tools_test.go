@@ -2,10 +2,12 @@ package worker
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -362,6 +364,132 @@ func TestLocalToolExecutorGitTools(t *testing.T) {
 	branchResp := executor.Execute(context.Background(), ExecuteToolRequest{ToolName: "git_branch", Arguments: `{}`})
 	if branchResp.IsError || strings.TrimSpace(branchResp.Stdout) == "" {
 		t.Fatalf("git_branch = %+v", branchResp)
+	}
+}
+
+func TestLocalToolExecutorWorkspaceSnapshotAndRestore(t *testing.T) {
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workspace, "notes.txt"), []byte("before\n"), 0644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	executor := NewLocalToolExecutor(workspace, nil)
+	snapshotResp := executor.Execute(context.Background(), ExecuteToolRequest{
+		ToolName:  "workspace_snapshot",
+		Arguments: `{"label":"unit test"}`,
+	})
+	if snapshotResp.IsError {
+		t.Fatalf("workspace_snapshot failed: %s", snapshotResp.Stderr)
+	}
+	var snapshot map[string]any
+	if err := json.Unmarshal([]byte(snapshotResp.Stdout), &snapshot); err != nil {
+		t.Fatalf("decode snapshot: %v", err)
+	}
+	ref, _ := snapshot["snapshot_ref"].(string)
+	if ref == "" {
+		t.Fatalf("snapshot response = %+v", snapshot)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "notes.txt"), []byte("after\n"), 0644); err != nil {
+		t.Fatalf("mutate fixture: %v", err)
+	}
+	restoreResp := executor.Execute(context.Background(), ExecuteToolRequest{
+		ToolName:  "workspace_restore",
+		Arguments: `{"snapshot_ref":` + strconv.Quote(ref) + `}`,
+	})
+	if restoreResp.IsError {
+		t.Fatalf("workspace_restore failed: %s", restoreResp.Stderr)
+	}
+	data, err := os.ReadFile(filepath.Join(workspace, "notes.txt"))
+	if err != nil {
+		t.Fatalf("read restored file: %v", err)
+	}
+	if string(data) != "before\n" {
+		t.Fatalf("restored content = %q", string(data))
+	}
+}
+
+func TestLocalToolExecutorSQLiteQuery(t *testing.T) {
+	workspace := t.TempDir()
+	dbPath := filepath.Join(workspace, "data.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open sqlite fixture: %v", err)
+	}
+	if _, err := db.Exec(`create table notes(id integer primary key, body text); insert into notes(body) values ('hello');`); err != nil {
+		_ = db.Close()
+		t.Fatalf("seed sqlite fixture: %v", err)
+	}
+	_ = db.Close()
+
+	executor := NewLocalToolExecutor(workspace, nil)
+	resp := executor.Execute(context.Background(), ExecuteToolRequest{
+		ToolName:  "sqlite_query",
+		Arguments: `{"path":"data.db","query":"select body from notes","max_rows":10}`,
+	})
+	if resp.IsError {
+		t.Fatalf("sqlite_query failed: %s", resp.Stderr)
+	}
+	if !strings.Contains(resp.Stdout, "hello") {
+		t.Fatalf("stdout = %q, want row content", resp.Stdout)
+	}
+	blocked := executor.Execute(context.Background(), ExecuteToolRequest{
+		ToolName:  "sqlite_query",
+		Arguments: `{"path":"data.db","query":"delete from notes"}`,
+	})
+	if !blocked.IsError || !strings.Contains(blocked.Stderr, "only allows") {
+		t.Fatalf("blocked response = %+v", blocked)
+	}
+}
+
+func TestLocalToolExecutorCodeOutlineAndSymbolSearch(t *testing.T) {
+	workspace := t.TempDir()
+	src := filepath.Join(workspace, "src")
+	if err := os.MkdirAll(src, 0755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "app.py"), []byte("class AgentRunner:\n    pass\n\ndef plan_task():\n    pass\n"), 0644); err != nil {
+		t.Fatalf("write app.py: %v", err)
+	}
+	executor := NewLocalToolExecutor(workspace, nil)
+	outline := executor.Execute(context.Background(), ExecuteToolRequest{
+		ToolName:  "code_outline",
+		Arguments: `{"path":"src"}`,
+	})
+	if outline.IsError {
+		t.Fatalf("code_outline failed: %s", outline.Stderr)
+	}
+	if !strings.Contains(outline.Stdout, "AgentRunner") || !strings.Contains(outline.Stdout, "plan_task") {
+		t.Fatalf("outline stdout = %q", outline.Stdout)
+	}
+	search := executor.Execute(context.Background(), ExecuteToolRequest{
+		ToolName:  "symbol_search",
+		Arguments: `{"query":"runner","path":"src"}`,
+	})
+	if search.IsError {
+		t.Fatalf("symbol_search failed: %s", search.Stderr)
+	}
+	if !strings.Contains(search.Stdout, "AgentRunner") {
+		t.Fatalf("search stdout = %q", search.Stdout)
+	}
+}
+
+func TestLocalToolExecutorRunTests(t *testing.T) {
+	executor := NewLocalToolExecutor(t.TempDir(), nil)
+	resp := executor.Execute(context.Background(), ExecuteToolRequest{
+		ToolName:  "run_tests",
+		Arguments: `{"command":"printf test-ok","timeout_seconds":5}`,
+	})
+	if resp.IsError {
+		t.Fatalf("run_tests failed: %s", resp.Stderr)
+	}
+	if !strings.Contains(resp.Stdout, "test-ok") {
+		t.Fatalf("stdout = %q", resp.Stdout)
+	}
+	missing := executor.Execute(context.Background(), ExecuteToolRequest{
+		ToolName:  "run_tests",
+		Arguments: `{}`,
+	})
+	if !missing.IsError || !strings.Contains(missing.Stderr, "no test command detected") {
+		t.Fatalf("missing command response = %+v", missing)
 	}
 }
 

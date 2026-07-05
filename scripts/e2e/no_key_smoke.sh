@@ -18,13 +18,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "[1/7] Go unit/integration tests"
+echo "[1/8] Go unit/integration tests"
 (cd "$ROOT/go" && go test ./...)
 
-echo "[2/7] Python unit tests"
+echo "[2/8] Python unit tests"
 (cd "$ROOT" && PYTHONPATH=python python3 -m unittest discover -s python/tests)
 
-echo "[3/7] CLI echo task"
+echo "[3/8] CLI echo task"
 cat > "$TMP_DIR/tenet.yaml" <<YAML
 database:
   path: "$TMP_DIR/tenet.db"
@@ -44,7 +44,7 @@ YAML
 (cd "$ROOT/go" && go run ./cmd/tenet task run --config "$TMP_DIR/tenet.yaml" --worker echo --workflow simple --workspace "$TMP_DIR/workspace" --output json "hello smoke" > "$TMP_DIR/cli_task.json")
 grep -q '"status":"COMPLETED"' "$TMP_DIR/cli_task.json"
 
-echo "[4/7] HTTP API echo task"
+echo "[4/8] HTTP API echo task"
 (cd "$ROOT/go" && go run ./cmd/tenet serve --config "$TMP_DIR/tenet.yaml" --http-port 18081 --port 19091 --worker-port 19092 > "$TMP_DIR/server.log" 2>&1 & echo $! > "$TMP_DIR/server.pid")
 for _ in $(seq 1 50); do
   if curl -fsS "http://127.0.0.1:18081/healthz" >/dev/null 2>&1; then
@@ -62,7 +62,7 @@ grep -q '"openapi":"3.0.3"' "$TMP_DIR/openapi.json"
 grep -q '"/tasks"' "$TMP_DIR/openapi.json"
 kill "$(cat "$TMP_DIR/server.pid")" >/dev/null 2>&1 || true
 
-echo "[5/7] Go -> Python gRPC smoke"
+echo "[5/8] Go -> Python gRPC smoke"
 if scripts/e2e/go_python_grpc_smoke.sh; then
   :
 else
@@ -74,7 +74,7 @@ else
   fi
 fi
 
-echo "[6/7] OpenAI-compatible mock task"
+echo "[6/8] OpenAI-compatible mock task"
 python3 "$ROOT/scripts/e2e/mock_openai_server.py" > "$TMP_DIR/mock_openai.log" 2>&1 & echo $! > "$TMP_DIR/mock_openai.pid"
 for _ in $(seq 1 50); do
   if curl -fsS -X POST "http://127.0.0.1:18082/chat/completions" \
@@ -89,10 +89,15 @@ export MOCK_OPENAI_API_KEY="mock-key"
 grep -q '"status":"COMPLETED"' "$TMP_DIR/openai_task.json"
 grep -q 'mock response' "$TMP_DIR/openai_task.json"
 
-echo "[7/7] DeepSeek-compatible mock task"
+echo "[7/8] DeepSeek-compatible mock task"
 export MOCK_DEEPSEEK_API_KEY="mock-key"
 (cd "$ROOT/go" && go run ./cmd/tenet task run --config "$TMP_DIR/tenet.yaml" --worker deepseek --base-url http://127.0.0.1:18082 --api-key-env MOCK_DEEPSEEK_API_KEY --model deepseek-mock --workflow simple --workspace "$TMP_DIR/workspace" --output json "deepseek mock smoke" > "$TMP_DIR/deepseek_task.json")
 grep -q '"status":"COMPLETED"' "$TMP_DIR/deepseek_task.json"
 grep -q 'mock response' "$TMP_DIR/deepseek_task.json"
+
+echo "[8/8] Tool failure trace smoke"
+(cd "$ROOT/go" && go run ./cmd/tenet task run --config "$TMP_DIR/tenet.yaml" --worker openai --base-url http://127.0.0.1:18082 --api-key-env MOCK_OPENAI_API_KEY --model mock-model --workflow react --workspace "$TMP_DIR/workspace" --output json "tool failure smoke" > "$TMP_DIR/tool_failure_task.json")
+grep -q '"status":"COMPLETED"' "$TMP_DIR/tool_failure_task.json"
+grep -q 'mock saw tool error' "$TMP_DIR/tool_failure_task.json"
 
 echo "no-key smoke: OK"

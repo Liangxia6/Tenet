@@ -13,6 +13,7 @@ import (
 	"time"
 
 	contextassembler "github.com/tenet/orchestrator/internal/context/assembler"
+	memorypkg "github.com/tenet/orchestrator/internal/memory"
 	"github.com/tenet/orchestrator/internal/worker"
 )
 
@@ -315,43 +316,90 @@ func generateThought(ctx context.Context, wfctx *WorkflowContext, task *TaskHand
 	}
 	traceContext := wfctx.GetVersion("context-assembler", 2) >= 2
 	if traceContext {
-		assembly := contextassembler.Assemble(contextassembler.Options{
-			SystemPrompt: systemPrompt,
-			Messages:     messages,
-			TokenBudget:  task.Config.Agent.DefaultTokenBudget,
-			MaxMessages:  24,
-		})
+		var memoryBlocks []contextassembler.MemoryBlock
+		if wfctx.GetVersion("memory-retrieval", 2) >= 2 {
+			var err error
+			memoryBlocks, err = retrieveMemoryBlocksForContext(ctx, wfctx, task, messages)
+			if err != nil {
+				return worker.GenerateThoughtResponse{}, err
+			}
+		}
+		assemblyOpts := contextAssemblyOptions(task, systemPrompt, messages)
+		assemblyOpts.MemoryBlocks = memoryBlocks
+		assembly := contextassembler.Assemble(assemblyOpts)
 		messages = assembly.Messages
+		if assembly.Compacted && wfctx.GetVersion("context-compression-events", 2) >= 2 {
+			if err := wfctx.Record(ctx, "ContextCompressionStarted", map[string]any{
+				"session_id":      task.SessionID,
+				"turn_id":         task.TurnID,
+				"run_id":          task.RunID,
+				"strategy":        assembly.Strategy,
+				"original_tokens": assembly.OriginalTokens,
+				"token_budget":    assemblyOpts.TokenBudget,
+				"primer_count":    assemblyOpts.PrimerCount,
+				"recent_count":    assemblyOpts.RecentCount,
+			}); err != nil {
+				return worker.GenerateThoughtResponse{}, err
+			}
+			if err := wfctx.Record(ctx, "ContextCompressionCompleted", map[string]any{
+				"session_id":         task.SessionID,
+				"turn_id":            task.TurnID,
+				"run_id":             task.RunID,
+				"strategy":           assembly.Strategy,
+				"original_tokens":    assembly.OriginalTokens,
+				"compressed_tokens":  assembly.EstimatedTokens,
+				"tokens_saved":       assembly.TokensSaved,
+				"compression_ratio":  assembly.CompressionRatio,
+				"omitted_refs":       assembly.OmittedRefs,
+				"omitted_count":      len(assembly.OmittedRefs),
+				"summary_injected":   assembly.Compacted,
+				"memory_refs":        assembly.MemoryRefs,
+				"message_count":      len(assembly.Messages),
+				"max_message_window": assemblyOpts.MaxMessages,
+			}); err != nil {
+				return worker.GenerateThoughtResponse{}, err
+			}
+		}
 		if err := wfctx.Record(ctx, "ContextAssembled", map[string]any{
-			"session_id":       task.SessionID,
-			"turn_id":          task.TurnID,
-			"run_id":           task.RunID,
-			"message_count":    len(assembly.Messages),
-			"included_refs":    assembly.IncludedRefs,
-			"omitted_refs":     assembly.OmittedRefs,
-			"omitted_count":    len(assembly.OmittedRefs),
-			"estimated_tokens": assembly.EstimatedTokens,
-			"input_chars":      assembly.InputChars,
-			"token_budget":     task.Config.Agent.DefaultTokenBudget,
-			"compacted":        assembly.Compacted,
+			"session_id":        task.SessionID,
+			"turn_id":           task.TurnID,
+			"run_id":            task.RunID,
+			"message_count":     len(assembly.Messages),
+			"included_refs":     assembly.IncludedRefs,
+			"omitted_refs":      assembly.OmittedRefs,
+			"omitted_count":     len(assembly.OmittedRefs),
+			"memory_refs":       assembly.MemoryRefs,
+			"original_tokens":   assembly.OriginalTokens,
+			"estimated_tokens":  assembly.EstimatedTokens,
+			"input_chars":       assembly.InputChars,
+			"token_budget":      assemblyOpts.TokenBudget,
+			"compacted":         assembly.Compacted,
+			"strategy":          assembly.Strategy,
+			"compression_ratio": assembly.CompressionRatio,
+			"tokens_saved":      assembly.TokensSaved,
+			"primer_count":      assemblyOpts.PrimerCount,
+			"recent_count":      assemblyOpts.RecentCount,
 		}); err != nil {
 			return worker.GenerateThoughtResponse{}, err
 		}
 		if assembly.Compacted {
 			if err := wfctx.Record(ctx, "ContextCompacted", map[string]any{
-				"session_id":       task.SessionID,
-				"turn_id":          task.TurnID,
-				"run_id":           task.RunID,
-				"omitted_refs":     assembly.OmittedRefs,
-				"omitted_count":    len(assembly.OmittedRefs),
-				"estimated_tokens": assembly.EstimatedTokens,
-				"token_budget":     task.Config.Agent.DefaultTokenBudget,
+				"session_id":        task.SessionID,
+				"turn_id":           task.TurnID,
+				"run_id":            task.RunID,
+				"omitted_refs":      assembly.OmittedRefs,
+				"omitted_count":     len(assembly.OmittedRefs),
+				"estimated_tokens":  assembly.EstimatedTokens,
+				"token_budget":      assemblyOpts.TokenBudget,
+				"strategy":          assembly.Strategy,
+				"compression_ratio": assembly.CompressionRatio,
+				"tokens_saved":      assembly.TokensSaved,
 			}); err != nil {
 				return worker.GenerateThoughtResponse{}, err
 			}
 		}
-		if task.Config.Agent.DefaultTokenBudget > 0 && assembly.EstimatedTokens > task.Config.Agent.DefaultTokenBudget {
-			return worker.GenerateThoughtResponse{}, fmt.Errorf("context token budget exceeded: estimated=%d budget=%d", assembly.EstimatedTokens, task.Config.Agent.DefaultTokenBudget)
+		if assemblyOpts.TokenBudget > 0 && assembly.EstimatedTokens > assemblyOpts.TokenBudget {
+			return worker.GenerateThoughtResponse{}, fmt.Errorf("context token budget exceeded: estimated=%d budget=%d", assembly.EstimatedTokens, assemblyOpts.TokenBudget)
 		}
 	}
 	traceLLM := wfctx.GetVersion("llm-call-trace", 2) >= 2
@@ -441,6 +489,204 @@ func generateThought(ctx context.Context, wfctx *WorkflowContext, task *TaskHand
 	return response, nil
 }
 
+func contextAssemblyOptions(task *TaskHandle, systemPrompt string, messages []worker.Message) contextassembler.Options {
+	tokenBudget := 8000
+	maxMessages := 24
+	strategy := "default"
+	primerCount := 0
+	recentCount := 0
+	compressionTriggerRatio := 1.0
+	compressionTargetRatio := 0.5
+	if task != nil && task.Config != nil {
+		tokenBudget = task.Config.Context.MaxContextTokens
+		if tokenBudget <= 0 {
+			tokenBudget = task.Config.Agent.DefaultTokenBudget
+		}
+		maxMessages = contextHistoryWindow(task.WorkflowType, task.Config.Context.HistoryWindowDefault, task.Config.Context.HistoryWindowDebugging)
+		strategy = contextStrategyForWorkflow(task.WorkflowType)
+		primerCount = task.Config.Context.PrimersCount
+		recentCount = task.Config.Context.RecentsCount
+		compressionTriggerRatio = task.Config.Context.CompressionTriggerRatio
+		compressionTargetRatio = task.Config.Context.CompressionTargetRatio
+	}
+	return contextassembler.Options{
+		SystemPrompt:            systemPrompt,
+		Messages:                messages,
+		TokenBudget:             tokenBudget,
+		MaxMessages:             maxMessages,
+		Strategy:                strategy,
+		PrimerCount:             primerCount,
+		RecentCount:             recentCount,
+		CompressionTriggerRatio: compressionTriggerRatio,
+		CompressionTargetRatio:  compressionTargetRatio,
+		MaxMemoryTokens:         maxMemoryTokensForTask(task),
+	}
+}
+
+func retrieveMemoryBlocksForContext(ctx context.Context, wfctx *WorkflowContext, task *TaskHandle, messages []worker.Message) ([]contextassembler.MemoryBlock, error) {
+	if wfctx == nil || task == nil || task.Config == nil {
+		return nil, nil
+	}
+	if wfctx.mode == ContextModeReplay {
+		for {
+			switch wfctx.nextHistoryEventType() {
+			case "MemoryRetrievalStarted":
+				if err := wfctx.Record(ctx, "MemoryRetrievalStarted", map[string]any{}); err != nil {
+					return nil, err
+				}
+			case "MemoryRetrievalCompleted":
+				if err := wfctx.Record(ctx, "MemoryRetrievalCompleted", map[string]any{}); err != nil {
+					return nil, err
+				}
+			case "MemoryRetrievalSkipped":
+				if err := wfctx.Record(ctx, "MemoryRetrievalSkipped", map[string]any{}); err != nil {
+					return nil, err
+				}
+			case "MemoryInjected":
+				if err := wfctx.Record(ctx, "MemoryInjected", map[string]any{}); err != nil {
+					return nil, err
+				}
+			default:
+				return nil, nil
+			}
+		}
+	}
+	query := memoryQueryForTask(task, messages)
+	limit := task.Config.Memory.MaxRetrievedMemories
+	if limit <= 0 {
+		limit = 8
+	}
+	if strings.TrimSpace(query) == "" {
+		return nil, wfctx.Record(ctx, "MemoryRetrievalSkipped", map[string]any{
+			"session_id": task.SessionID,
+			"turn_id":    task.TurnID,
+			"run_id":     task.RunID,
+			"reason":     "empty query",
+		})
+	}
+	if err := wfctx.Record(ctx, "MemoryRetrievalStarted", map[string]any{
+		"session_id": task.SessionID,
+		"turn_id":    task.TurnID,
+		"run_id":     task.RunID,
+		"source":     "sqlite_fts",
+		"query_hash": hashText(query),
+		"limit":      limit,
+	}); err != nil {
+		return nil, err
+	}
+	retriever := memorypkg.NewSQLiteRetriever(wfctx.store)
+	memories, err := retriever.Retrieve(ctx, memorypkg.RetrievalQuery{
+		Query:          query,
+		StreamID:       task.StreamID,
+		Workspace:      task.Workspace,
+		Limit:          limit,
+		MaxTokens:      maxMemoryTokensForTask(task),
+		CrossSession:   task.Config.Memory.CrossSessionEnabled,
+		CrossWorkspace: task.Config.Memory.CrossWorkspaceEnabled,
+	})
+	if err != nil {
+		if recordErr := wfctx.Record(ctx, "MemoryRetrievalSkipped", map[string]any{
+			"session_id": task.SessionID,
+			"turn_id":    task.TurnID,
+			"run_id":     task.RunID,
+			"source":     "sqlite_fts",
+			"reason":     err.Error(),
+		}); recordErr != nil {
+			return nil, recordErr
+		}
+		return nil, nil
+	}
+	blocks := make([]contextassembler.MemoryBlock, 0, len(memories))
+	refs := make([]contextassembler.MemoryRef, 0, len(memories))
+	for _, item := range memories {
+		ref := contextassembler.MemoryRef{
+			ID:     item.ID,
+			Kind:   item.Kind,
+			Source: item.Source,
+			Score:  item.Score,
+			Reason: item.Reason,
+		}
+		refs = append(refs, ref)
+		blocks = append(blocks, contextassembler.MemoryBlock{Ref: ref, Content: item.Content})
+	}
+	if err := wfctx.Record(ctx, "MemoryRetrievalCompleted", map[string]any{
+		"session_id":   task.SessionID,
+		"turn_id":      task.TurnID,
+		"run_id":       task.RunID,
+		"source":       "sqlite_fts",
+		"memory_count": len(refs),
+		"memory_refs":  refs,
+	}); err != nil {
+		return nil, err
+	}
+	if len(refs) > 0 {
+		if err := wfctx.Record(ctx, "MemoryInjected", map[string]any{
+			"session_id":  task.SessionID,
+			"turn_id":     task.TurnID,
+			"run_id":      task.RunID,
+			"memory_refs": refs,
+		}); err != nil {
+			return nil, err
+		}
+	}
+	return blocks, nil
+}
+
+func maxMemoryTokensForTask(task *TaskHandle) int {
+	if task == nil || task.Config == nil || task.Config.Context.MaxMemoryTokens <= 0 {
+		return 8000
+	}
+	return task.Config.Context.MaxMemoryTokens
+}
+
+func memoryQueryForTask(task *TaskHandle, messages []worker.Message) string {
+	if task != nil && strings.TrimSpace(task.Query) != "" {
+		return task.Query
+	}
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" && strings.TrimSpace(messages[i].Content) != "" {
+			return messages[i].Content
+		}
+	}
+	return ""
+}
+
+func contextHistoryWindow(workflowType string, defaultWindow int, debuggingWindow int) int {
+	if defaultWindow <= 0 {
+		defaultWindow = 24
+	}
+	if debuggingWindow <= 0 {
+		debuggingWindow = defaultWindow
+	}
+	switch strings.ToLower(strings.TrimSpace(workflowType)) {
+	case "coding", "react", "interactive":
+		return debuggingWindow
+	default:
+		return defaultWindow
+	}
+}
+
+func contextStrategyForWorkflow(workflowType string) string {
+	switch strings.ToLower(strings.TrimSpace(workflowType)) {
+	case "coding":
+		return "coding_debug"
+	case "react":
+		return "react"
+	case "dag":
+		return "multi_agent"
+	case "scientific":
+		return "research"
+	case "interactive":
+		return "interactive"
+	default:
+		return "default"
+	}
+}
+
+// executeTool 是所有 workflow 调用工具前后的统一审计点。
+// 这里集中完成 allowlist、审批挂起、限流、fencing token 校验、
+// 工具调用事件、错误分类、touched_files 推断等逻辑。
+// 新增工具安全策略时，优先看这里，而不是散落到每个 workflow。
 func executeTool(ctx context.Context, wfctx *WorkflowContext, task *TaskHandle, call worker.ToolCall) (worker.ExecuteToolResponse, error) {
 	traceTool := wfctx.GetVersion("tool-runtime-trace", 2) >= 2
 	callID := call.CallID

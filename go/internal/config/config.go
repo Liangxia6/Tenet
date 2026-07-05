@@ -26,6 +26,8 @@ type RuntimeConfig struct {
 	Workspace   WorkspaceConfig   `yaml:"workspace"`
 	Skills      SkillsConfig      `yaml:"skills"`
 	Agent       AgentConfig       `yaml:"agent"`
+	Context     ContextConfig     `yaml:"context"`
+	Memory      MemoryConfig      `yaml:"memory"`
 	Safety      SafetyConfig      `yaml:"safety"`
 	Interactive InteractiveConfig `yaml:"interactive"`
 	RateLimits  RateLimitConfig   `yaml:"rate_limits"`
@@ -184,6 +186,54 @@ func (c *RuntimeConfig) applyDefaults() {
 	if c.Agent.DefaultTokenBudget == 0 {
 		c.Agent.DefaultTokenBudget = 100000
 	}
+	if c.Context.HistoryWindowDefault == 0 {
+		c.Context.HistoryWindowDefault = 24
+	}
+	if c.Context.HistoryWindowDebugging == 0 {
+		c.Context.HistoryWindowDebugging = 75
+	}
+	if c.Context.PrimersCount == 0 {
+		c.Context.PrimersCount = 3
+	}
+	if c.Context.RecentsCount == 0 {
+		c.Context.RecentsCount = 20
+	}
+	if c.Context.CompressionTriggerRatio == 0 {
+		c.Context.CompressionTriggerRatio = 0.75
+	}
+	if c.Context.CompressionTargetRatio == 0 {
+		c.Context.CompressionTargetRatio = 0.375
+	}
+	if c.Context.MaxContextTokens == 0 {
+		c.Context.MaxContextTokens = c.Agent.DefaultTokenBudget
+	}
+	if c.Context.MaxMemoryTokens == 0 {
+		c.Context.MaxMemoryTokens = 8000
+	}
+	if c.Context.MaxToolResultTokens == 0 {
+		c.Context.MaxToolResultTokens = 12000
+	}
+	if c.Memory.RedisTTLHours == 0 {
+		c.Memory.RedisTTLHours = 720
+	}
+	if c.Memory.VectorProvider == "" {
+		c.Memory.VectorProvider = "qdrant"
+	}
+	if c.Memory.QdrantURL == "" {
+		c.Memory.QdrantURL = "http://127.0.0.1:6333"
+	}
+	if c.Memory.EmbeddingProvider == "" {
+		c.Memory.EmbeddingProvider = "openai"
+	}
+	if c.Memory.EmbeddingModel == "" {
+		c.Memory.EmbeddingModel = "text-embedding-3-small"
+	}
+	if c.Memory.MaxRetrievedMemories == 0 {
+		c.Memory.MaxRetrievedMemories = 8
+	}
+	if c.Memory.MMRLambda == 0 {
+		c.Memory.MMRLambda = 0.7
+	}
 	if c.Logging.Level == "" {
 		c.Logging.Level = "info"
 	}
@@ -255,6 +305,34 @@ type AgentConfig struct {
 	ConvergenceNoToolCalls       int     `yaml:"convergence_no_tool_calls"`
 	LoopDetectionRepeatThreshold int     `yaml:"loop_detection_repeat_threshold"`
 	DefaultTokenBudget           int     `yaml:"default_token_budget"`
+}
+
+type ContextConfig struct {
+	HistoryWindowDefault    int     `yaml:"history_window_default"`
+	HistoryWindowDebugging  int     `yaml:"history_window_debugging"`
+	PrimersCount            int     `yaml:"primers_count"`
+	RecentsCount            int     `yaml:"recents_count"`
+	CompressionTriggerRatio float64 `yaml:"compression_trigger_ratio"`
+	CompressionTargetRatio  float64 `yaml:"compression_target_ratio"`
+	MaxContextTokens        int     `yaml:"max_context_tokens"`
+	MaxMemoryTokens         int     `yaml:"max_memory_tokens"`
+	MaxToolResultTokens     int     `yaml:"max_tool_result_tokens"`
+	EnableVectorMemory      bool    `yaml:"enable_vector_memory"`
+}
+
+type MemoryConfig struct {
+	RedisTTLHours         int     `yaml:"redis_ttl_hours"`
+	SQLiteFTSEnabled      bool    `yaml:"sqlite_fts_enabled"`
+	VectorProvider        string  `yaml:"vector_provider"`
+	QdrantURL             string  `yaml:"qdrant_url"`
+	EmbeddingProvider     string  `yaml:"embedding_provider"`
+	EmbeddingModel        string  `yaml:"embedding_model"`
+	MaxRetrievedMemories  int     `yaml:"max_retrieved_memories"`
+	MMRLambda             float64 `yaml:"mmr_lambda"`
+	CrossSessionEnabled   bool    `yaml:"cross_session_enabled"`
+	CrossWorkspaceEnabled bool    `yaml:"cross_workspace_enabled"`
+	RedactBeforeWrite     bool    `yaml:"redact_before_write"`
+	DefaultTTLHours       int     `yaml:"default_ttl_hours"`
 }
 
 type SafetyConfig struct {

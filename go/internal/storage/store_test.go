@@ -326,11 +326,15 @@ func TestSQLiteStoreMemoryFTS(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	entry, err := store.SaveMemoryEntry(ctx, MemoryEntry{
-		StreamID: "task:memory",
-		TurnID:   "turn:1",
-		RunID:    "run:1",
-		Kind:     "session_summary",
-		Content:  "Tenet fixed a parser bug and ran tests.",
+		StreamID:       "task:memory",
+		TurnID:         "turn:1",
+		RunID:          "run:1",
+		Workspace:      "/tmp/workspace",
+		Kind:           "session_summary",
+		Content:        "Tenet fixed a parser bug and ran tests.",
+		SummaryLevel:   1,
+		SourceEventSeq: 7,
+		Importance:     0.8,
 	})
 	if err != nil {
 		t.Fatalf("SaveMemoryEntry: %v", err)
@@ -344,5 +348,36 @@ func TestSQLiteStoreMemoryFTS(t *testing.T) {
 	}
 	if len(results) != 1 || results[0].StreamID != "task:memory" || results[0].Kind != "session_summary" {
 		t.Fatalf("results = %+v", results)
+	}
+	if results[0].Workspace != "/tmp/workspace" || results[0].SummaryLevel != 1 || results[0].SourceEventSeq != 7 || results[0].Importance != 0.8 {
+		t.Fatalf("memory metadata = %+v", results[0])
+	}
+	if results[0].TokenEstimate <= 0 {
+		t.Fatalf("token estimate = %+v", results[0])
+	}
+	filtered, err := store.SearchMemoryEntries(ctx, MemorySearchQuery{
+		Query:     "parser",
+		StreamID:  "task:memory",
+		Workspace: "/tmp/workspace",
+		Kinds:     []string{"session_summary"},
+		Limit:     10,
+	})
+	if err != nil {
+		t.Fatalf("SearchMemoryEntries: %v", err)
+	}
+	if len(filtered) != 1 || filtered[0].ID != entry.ID {
+		t.Fatalf("filtered = %+v", filtered)
+	}
+	missing, err := store.SearchMemoryEntries(ctx, MemorySearchQuery{
+		Query:     "parser",
+		StreamID:  "task:memory",
+		Workspace: "/tmp/other",
+		Limit:     10,
+	})
+	if err != nil {
+		t.Fatalf("SearchMemoryEntries missing: %v", err)
+	}
+	if len(missing) != 0 {
+		t.Fatalf("missing = %+v", missing)
 	}
 }

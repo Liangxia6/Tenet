@@ -53,6 +53,9 @@ type WorkflowContext struct {
 	mu              sync.Mutex
 }
 
+// DecisionPayload 是 Decide 事件的标准载荷。
+// WorkflowContext.Decide 用它包住 LLM/工具等外部副作用：
+// 执行模式写入结果，Replay 模式只消费历史结果，从而验证 workflow 是否确定性。
 type DecisionPayload struct {
 	Result any    `json:"result"`
 	Error  string `json:"error,omitempty"`

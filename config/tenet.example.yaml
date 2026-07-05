@@ -56,6 +56,32 @@ agent:
   loop_detection_repeat_threshold: 3
   default_token_budget: 100000
 
+context:
+  history_window_default: 24
+  history_window_debugging: 75
+  primers_count: 3
+  recents_count: 20
+  compression_trigger_ratio: 0.75
+  compression_target_ratio: 0.375
+  max_context_tokens: 100000
+  max_memory_tokens: 8000
+  max_tool_result_tokens: 12000
+  enable_vector_memory: false
+
+memory:
+  redis_ttl_hours: 720
+  sqlite_fts_enabled: true
+  vector_provider: qdrant
+  qdrant_url: http://127.0.0.1:6333
+  embedding_provider: openai
+  embedding_model: text-embedding-3-small
+  max_retrieved_memories: 8
+  mmr_lambda: 0.7
+  cross_session_enabled: false
+  cross_workspace_enabled: false
+  redact_before_write: true
+  default_ttl_hours: 720
+
 safety:
   require_approval: []
   tool_allowlist: []

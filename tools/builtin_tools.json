@@ -75,9 +75,39 @@
     "parameters_schema": "{\"type\":\"object\",\"properties\":{\"all\":{\"type\":\"boolean\"}}}"
   },
   {
+    "name": "workspace_snapshot",
+    "description": "Create an archive snapshot of the current workspace. Arguments: optional label.",
+    "parameters_schema": "{\"type\":\"object\",\"properties\":{\"label\":{\"type\":\"string\"}}}"
+  },
+  {
+    "name": "workspace_restore",
+    "description": "Restore a workspace archive snapshot created by workspace_snapshot. Arguments: snapshot_ref, optional clean.",
+    "parameters_schema": "{\"type\":\"object\",\"properties\":{\"snapshot_ref\":{\"type\":\"string\"},\"clean\":{\"type\":\"boolean\"}},\"required\":[\"snapshot_ref\"]}"
+  },
+  {
     "name": "http_fetch",
     "description": "Fetch a URL with GET and return status, content type, and body preview. Arguments: url, optional max_bytes.",
     "parameters_schema": "{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"},\"max_bytes\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":200000}},\"required\":[\"url\"]}"
+  },
+  {
+    "name": "sqlite_query",
+    "description": "Run a read-only SQLite SELECT or PRAGMA query against a database file inside the workspace. Arguments: path, query, optional max_rows.",
+    "parameters_schema": "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"query\":{\"type\":\"string\"},\"max_rows\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1000}},\"required\":[\"path\",\"query\"]}"
+  },
+  {
+    "name": "symbol_search",
+    "description": "Search likely code symbols by name inside workspace text files. Arguments: query, optional path, max_results.",
+    "parameters_schema": "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"path\":{\"type\":\"string\"},\"max_results\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1000}},\"required\":[\"query\"]}"
+  },
+  {
+    "name": "code_outline",
+    "description": "Return a lightweight outline of functions/classes/types in a file or directory. Arguments: optional path, max_symbols.",
+    "parameters_schema": "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"max_symbols\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":2000}}}"
+  },
+  {
+    "name": "run_tests",
+    "description": "Run a project test command inside the workspace with timeout handling. Arguments: optional command, timeout_seconds.",
+    "parameters_schema": "{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\"},\"timeout_seconds\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1200}}}"
   },
   {
     "name": "web_search",

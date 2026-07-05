@@ -24,30 +24,34 @@ const (
 )
 
 type TaskView struct {
-	StreamID         string          `json:"stream_id"`
-	SessionID        string          `json:"session_id,omitempty"`
-	Status           TaskStatus      `json:"status"`
-	Query            string          `json:"query,omitempty"`
-	Workspace        string          `json:"workspace,omitempty"`
-	WorkflowType     string          `json:"workflow_type,omitempty"`
-	CurrentTurnID    string          `json:"current_turn_id,omitempty"`
-	CurrentRunID     string          `json:"current_run_id,omitempty"`
-	CurrentPhase     string          `json:"current_phase,omitempty"`
-	Progress         Progress        `json:"progress"`
-	Turns            []TurnState     `json:"turns,omitempty"`
-	Runs             []RunState      `json:"runs,omitempty"`
-	LLMCalls         []LLMCallState  `json:"llm_calls,omitempty"`
-	Contexts         []ContextState  `json:"contexts,omitempty"`
-	ToolCalls        []ToolCallState `json:"tool_calls,omitempty"`
-	Subtasks         []SubTaskState  `json:"subtasks,omitempty"`
-	FinalAnswer      string          `json:"final_answer,omitempty"`
-	SessionSummary   string          `json:"session_summary,omitempty"`
-	WorkspaceSummary string          `json:"workspace_summary,omitempty"`
-	Error            string          `json:"error,omitempty"`
-	Timeline         TimelineState   `json:"timeline"`
-	Tokens           TokenState      `json:"tokens"`
+	StreamID         string                 `json:"stream_id"`
+	SessionID        string                 `json:"session_id,omitempty"`
+	Status           TaskStatus             `json:"status"`
+	Query            string                 `json:"query,omitempty"`
+	Workspace        string                 `json:"workspace,omitempty"`
+	WorkflowType     string                 `json:"workflow_type,omitempty"`
+	CurrentTurnID    string                 `json:"current_turn_id,omitempty"`
+	CurrentRunID     string                 `json:"current_run_id,omitempty"`
+	CurrentPhase     string                 `json:"current_phase,omitempty"`
+	Progress         Progress               `json:"progress"`
+	Turns            []TurnState            `json:"turns,omitempty"`
+	Runs             []RunState             `json:"runs,omitempty"`
+	LLMCalls         []LLMCallState         `json:"llm_calls,omitempty"`
+	Contexts         []ContextState         `json:"contexts,omitempty"`
+	MemoryRetrievals []MemoryRetrievalState `json:"memory_retrievals,omitempty"`
+	ToolCalls        []ToolCallState        `json:"tool_calls,omitempty"`
+	Subtasks         []SubTaskState         `json:"subtasks,omitempty"`
+	FinalAnswer      string                 `json:"final_answer,omitempty"`
+	SessionSummary   string                 `json:"session_summary,omitempty"`
+	WorkspaceSummary string                 `json:"workspace_summary,omitempty"`
+	Error            string                 `json:"error,omitempty"`
+	Timeline         TimelineState          `json:"timeline"`
+	Tokens           TokenState             `json:"tokens"`
 }
 
+// TaskProjection 把 append-only event log 投影成前端/API 易读的任务状态。
+// 事件日志负责“事实不可变”，Projection 负责“当前视图可查询”：
+// turns/runs、LLM calls、tool calls、context、token、timeline 都在这里聚合。
 type Progress struct {
 	CompletedSteps int `json:"completed_steps"`
 	TotalSteps     int `json:"total_steps"`
@@ -105,18 +109,25 @@ type LLMCallState struct {
 }
 
 type ContextState struct {
-	Seq             int64      `json:"seq"`
-	SessionID       string     `json:"session_id,omitempty"`
-	TurnID          string     `json:"turn_id,omitempty"`
-	RunID           string     `json:"run_id,omitempty"`
-	MessageCount    int        `json:"message_count"`
-	EstimatedTokens int        `json:"estimated_tokens"`
-	InputChars      int        `json:"input_chars"`
-	TokenBudget     int        `json:"token_budget,omitempty"`
-	Compacted       bool       `json:"compacted"`
-	OmittedCount    int        `json:"omitted_count,omitempty"`
-	IncludedRefs    []EventRef `json:"included_refs,omitempty"`
-	OmittedRefs     []EventRef `json:"omitted_refs,omitempty"`
+	Seq              int64       `json:"seq"`
+	SessionID        string      `json:"session_id,omitempty"`
+	TurnID           string      `json:"turn_id,omitempty"`
+	RunID            string      `json:"run_id,omitempty"`
+	Strategy         string      `json:"strategy,omitempty"`
+	MessageCount     int         `json:"message_count"`
+	OriginalTokens   int         `json:"original_tokens,omitempty"`
+	EstimatedTokens  int         `json:"estimated_tokens"`
+	InputChars       int         `json:"input_chars"`
+	TokenBudget      int         `json:"token_budget,omitempty"`
+	Compacted        bool        `json:"compacted"`
+	OmittedCount     int         `json:"omitted_count,omitempty"`
+	CompressionRatio float64     `json:"compression_ratio,omitempty"`
+	TokensSaved      int         `json:"tokens_saved,omitempty"`
+	PrimerCount      int         `json:"primer_count,omitempty"`
+	RecentCount      int         `json:"recent_count,omitempty"`
+	IncludedRefs     []EventRef  `json:"included_refs,omitempty"`
+	OmittedRefs      []EventRef  `json:"omitted_refs,omitempty"`
+	MemoryRefs       []MemoryRef `json:"memory_refs,omitempty"`
 }
 
 type ToolCallState struct {
@@ -142,6 +153,30 @@ type EventRef struct {
 	Index int    `json:"index"`
 	Role  string `json:"role,omitempty"`
 	Chars int    `json:"chars,omitempty"`
+}
+
+type MemoryRef struct {
+	ID     string  `json:"id,omitempty"`
+	Kind   string  `json:"kind,omitempty"`
+	Source string  `json:"source,omitempty"`
+	Score  float64 `json:"score,omitempty"`
+	Reason string  `json:"reason,omitempty"`
+}
+
+type MemoryRetrievalState struct {
+	Seq          int64       `json:"seq"`
+	SessionID    string      `json:"session_id,omitempty"`
+	TurnID       string      `json:"turn_id,omitempty"`
+	RunID        string      `json:"run_id,omitempty"`
+	Source       string      `json:"source,omitempty"`
+	Status       TaskStatus  `json:"status"`
+	QueryHash    string      `json:"query_hash,omitempty"`
+	Limit        int         `json:"limit,omitempty"`
+	MemoryCount  int         `json:"memory_count,omitempty"`
+	MemoryRefs   []MemoryRef `json:"memory_refs,omitempty"`
+	Reason       string      `json:"reason,omitempty"`
+	StartedSeq   int64       `json:"started_seq,omitempty"`
+	CompletedSeq int64       `json:"completed_seq,omitempty"`
 }
 
 type TimelineState struct {
@@ -429,23 +464,56 @@ func (p *TaskProjection) Apply(event storage.Event) error {
 		}
 	case "ContextAssembled":
 		state := ContextState{
-			Seq:             event.StreamSeq,
-			SessionID:       stringValue(payload, "session_id"),
-			TurnID:          stringValue(payload, "turn_id"),
-			RunID:           stringValue(payload, "run_id"),
-			MessageCount:    intValue(payload, "message_count"),
-			EstimatedTokens: intValue(payload, "estimated_tokens"),
-			InputChars:      intValue(payload, "input_chars"),
-			TokenBudget:     intValue(payload, "token_budget"),
-			Compacted:       boolValue(payload, "compacted"),
-			OmittedCount:    intValue(payload, "omitted_count"),
-			IncludedRefs:    eventRefsValue(payload, "included_refs"),
-			OmittedRefs:     eventRefsValue(payload, "omitted_refs"),
+			Seq:              event.StreamSeq,
+			SessionID:        stringValue(payload, "session_id"),
+			TurnID:           stringValue(payload, "turn_id"),
+			RunID:            stringValue(payload, "run_id"),
+			Strategy:         stringValue(payload, "strategy"),
+			MessageCount:     intValue(payload, "message_count"),
+			OriginalTokens:   intValue(payload, "original_tokens"),
+			EstimatedTokens:  intValue(payload, "estimated_tokens"),
+			InputChars:       intValue(payload, "input_chars"),
+			TokenBudget:      intValue(payload, "token_budget"),
+			Compacted:        boolValue(payload, "compacted"),
+			OmittedCount:     intValue(payload, "omitted_count"),
+			CompressionRatio: floatValue(payload, "compression_ratio"),
+			TokensSaved:      intValue(payload, "tokens_saved"),
+			PrimerCount:      intValue(payload, "primer_count"),
+			RecentCount:      intValue(payload, "recent_count"),
+			IncludedRefs:     eventRefsValue(payload, "included_refs"),
+			OmittedRefs:      eventRefsValue(payload, "omitted_refs"),
+			MemoryRefs:       memoryRefsValue(payload, "memory_refs"),
 		}
 		p.state.Contexts = append(p.state.Contexts, state)
-		p.appendTimeline(event, TimelineStep{Seq: event.StreamSeq, Type: "context_assembled", Content: fmt.Sprintf("messages=%d tokens~=%d", state.MessageCount, state.EstimatedTokens), Timestamp: event.Timestamp})
+		p.appendTimeline(event, TimelineStep{Seq: event.StreamSeq, Type: "context_assembled", Content: fmt.Sprintf("strategy=%s messages=%d tokens~=%d", firstNonEmpty(state.Strategy, "default"), state.MessageCount, state.EstimatedTokens), Timestamp: event.Timestamp})
+	case "ContextCompressionStarted":
+		p.appendTimeline(event, TimelineStep{Seq: event.StreamSeq, Type: "context_compression_started", Content: fmt.Sprintf("strategy=%s original=%d", firstNonEmpty(stringValue(payload, "strategy"), "default"), intValue(payload, "original_tokens")), Timestamp: event.Timestamp})
+	case "ContextCompressionCompleted":
+		p.appendTimeline(event, TimelineStep{Seq: event.StreamSeq, Type: "context_compression_completed", Content: fmt.Sprintf("saved=%d ratio=%.2f", intValue(payload, "tokens_saved"), floatValue(payload, "compression_ratio")), Timestamp: event.Timestamp})
 	case "ContextCompacted":
-		p.appendTimeline(event, TimelineStep{Seq: event.StreamSeq, Type: "context_compacted", Content: fmt.Sprintf("omitted=%d tokens~=%d", intValue(payload, "omitted_count"), intValue(payload, "estimated_tokens")), Timestamp: event.Timestamp})
+		p.appendTimeline(event, TimelineStep{Seq: event.StreamSeq, Type: "context_compacted", Content: fmt.Sprintf("omitted=%d saved=%d tokens~=%d", intValue(payload, "omitted_count"), intValue(payload, "tokens_saved"), intValue(payload, "estimated_tokens")), Timestamp: event.Timestamp})
+	case "MemoryRetrievalStarted":
+		retrieval := MemoryRetrievalState{
+			Seq:        event.StreamSeq,
+			SessionID:  stringValue(payload, "session_id"),
+			TurnID:     stringValue(payload, "turn_id"),
+			RunID:      stringValue(payload, "run_id"),
+			Source:     stringValue(payload, "source"),
+			Status:     StatusRunning,
+			QueryHash:  stringValue(payload, "query_hash"),
+			Limit:      intValue(payload, "limit"),
+			StartedSeq: event.StreamSeq,
+		}
+		p.state.MemoryRetrievals = append(p.state.MemoryRetrievals, retrieval)
+		p.appendTimeline(event, TimelineStep{Seq: event.StreamSeq, Type: "memory_retrieval_started", Content: firstNonEmpty(retrieval.Source, "memory"), Timestamp: event.Timestamp})
+	case "MemoryRetrievalCompleted":
+		p.completeMemoryRetrieval(StatusCompleted, event.StreamSeq, payload)
+		p.appendTimeline(event, TimelineStep{Seq: event.StreamSeq, Type: "memory_retrieval_completed", Content: fmt.Sprintf("source=%s count=%d", firstNonEmpty(stringValue(payload, "source"), "memory"), intValue(payload, "memory_count")), Timestamp: event.Timestamp})
+	case "MemoryRetrievalSkipped":
+		p.completeMemoryRetrieval(StatusCompleted, event.StreamSeq, payload)
+		p.appendTimeline(event, TimelineStep{Seq: event.StreamSeq, Type: "memory_retrieval_skipped", Content: stringValue(payload, "reason"), Timestamp: event.Timestamp})
+	case "MemoryInjected":
+		p.appendTimeline(event, TimelineStep{Seq: event.StreamSeq, Type: "memory_injected", Content: fmt.Sprintf("count=%d", len(memoryRefsValue(payload, "memory_refs"))), Timestamp: event.Timestamp})
 	case "ToolCallStarted":
 		callID := stringValue(payload, "tool_call_id")
 		if callID != "" {
@@ -835,6 +903,48 @@ func (p *TaskProjection) completeLLMCall(callID string, status TaskStatus, seq i
 	p.state.LLMCalls[idx] = call
 }
 
+func (p *TaskProjection) completeMemoryRetrieval(status TaskStatus, seq int64, payload map[string]any) {
+	retrieval := p.findOpenMemoryRetrieval(payload)
+	if retrieval == nil {
+		p.state.MemoryRetrievals = append(p.state.MemoryRetrievals, MemoryRetrievalState{
+			Seq:        seq,
+			SessionID:  stringValue(payload, "session_id"),
+			TurnID:     stringValue(payload, "turn_id"),
+			RunID:      stringValue(payload, "run_id"),
+			Source:     stringValue(payload, "source"),
+			StartedSeq: seq,
+		})
+		retrieval = &p.state.MemoryRetrievals[len(p.state.MemoryRetrievals)-1]
+	}
+	retrieval.Status = status
+	retrieval.CompletedSeq = seq
+	retrieval.MemoryCount = firstNonZeroInt(intValue(payload, "memory_count"), retrieval.MemoryCount)
+	retrieval.MemoryRefs = firstNonEmptyMemoryRefs(memoryRefsValue(payload, "memory_refs"), retrieval.MemoryRefs)
+	retrieval.Reason = firstNonEmpty(stringValue(payload, "reason"), retrieval.Reason)
+	if retrieval.Source == "" {
+		retrieval.Source = stringValue(payload, "source")
+	}
+}
+
+func (p *TaskProjection) findOpenMemoryRetrieval(payload map[string]any) *MemoryRetrievalState {
+	runID := stringValue(payload, "run_id")
+	source := stringValue(payload, "source")
+	for i := len(p.state.MemoryRetrievals) - 1; i >= 0; i-- {
+		retrieval := &p.state.MemoryRetrievals[i]
+		if retrieval.CompletedSeq != 0 {
+			continue
+		}
+		if runID != "" && retrieval.RunID != "" && retrieval.RunID != runID {
+			continue
+		}
+		if source != "" && retrieval.Source != "" && retrieval.Source != source {
+			continue
+		}
+		return retrieval
+	}
+	return nil
+}
+
 func (p *TaskProjection) upsertToolCall(call ToolCallState) {
 	if call.ID == "" {
 		return
@@ -997,6 +1107,28 @@ func eventRefsValue(values map[string]any, key string) []EventRef {
 	return refs
 }
 
+func memoryRefsValue(values map[string]any, key string) []MemoryRef {
+	raw, ok := values[key].([]any)
+	if !ok {
+		return nil
+	}
+	refs := make([]MemoryRef, 0, len(raw))
+	for _, item := range raw {
+		value, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		refs = append(refs, MemoryRef{
+			ID:     stringValue(value, "id"),
+			Kind:   stringValue(value, "kind"),
+			Source: stringValue(value, "source"),
+			Score:  floatValue(value, "score"),
+			Reason: stringValue(value, "reason"),
+		})
+	}
+	return refs
+}
+
 func stringSliceValue(values map[string]any, key string) []string {
 	raw, ok := values[key].([]any)
 	if !ok {
@@ -1056,6 +1188,15 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func firstNonEmptyMemoryRefs(values ...[]MemoryRef) []MemoryRef {
+	for _, value := range values {
+		if len(value) > 0 {
+			return value
+		}
+	}
+	return nil
 }
 
 func firstNonZeroInt(values ...int) int {

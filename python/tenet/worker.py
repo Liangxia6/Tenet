@@ -10,6 +10,12 @@ from .tools import ToolRegistry, ToolResult
 
 
 class StatelessWorker:
+    """Python Worker 的无状态执行单元。
+
+    Go Orchestrator 通过 gRPC 调用这里的 generate_thought / execute_tool。
+    Worker 本身不保存任务状态，状态都在 Go 侧事件日志里；这样失败恢复和 replay 才有统一来源。
+    """
+
     def __init__(
         self,
         adapter: LLMAdapter | None = None,
@@ -22,6 +28,7 @@ class StatelessWorker:
         self.started_at = time.monotonic()
 
     async def generate_thought(self, request: dict[str, Any]) -> dict[str, Any]:
+        # LLM 调用入口：ProviderRouter 会根据环境变量选择 echo/openai/deepseek。
         response = await self.adapter.generate(
             task_id=str(request.get("task_id", "")),
             system_prompt=str(request.get("system_prompt", "")),
@@ -33,6 +40,8 @@ class StatelessWorker:
         return asdict(response)
 
     async def execute_tool(self, request: dict[str, Any]) -> ToolResult:
+        # 工具执行入口：先校验 fencing token，再把调用交给 ToolRegistry。
+        # 这里的结果会被 Go 侧记录成 ToolExecuted / ToolCallCompleted 事件。
         fencing_error = validate_fencing_token(request)
         if fencing_error:
             return ToolResult(stderr=fencing_error, exit_code=126, is_error=True)

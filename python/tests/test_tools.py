@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import subprocess
 import unittest
 from unittest.mock import patch
@@ -139,6 +140,63 @@ class ToolRegistryTests(unittest.TestCase):
             result = registry.execute("git_branch", {}, workspace)
             self.assertFalse(result.is_error, result.stderr)
             self.assertTrue(result.stdout.strip())
+
+    def test_workspace_snapshot_and_restore(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "notes.txt").write_text("before\n", encoding="utf-8")
+            registry = ToolRegistry()
+            result = registry.execute("workspace_snapshot", {"label": "unit test"}, workspace)
+            self.assertFalse(result.is_error, result.stderr)
+            ref = json.loads(result.stdout)["snapshot_ref"]
+
+            (workspace / "notes.txt").write_text("after\n", encoding="utf-8")
+            result = registry.execute("workspace_restore", {"snapshot_ref": ref}, workspace)
+            self.assertFalse(result.is_error, result.stderr)
+            self.assertEqual((workspace / "notes.txt").read_text(encoding="utf-8"), "before\n")
+
+    def test_sqlite_query(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            db_path = workspace / "data.db"
+            with sqlite3.connect(db_path) as conn:
+                conn.executescript("create table notes(id integer primary key, body text); insert into notes(body) values ('hello');")
+            registry = ToolRegistry()
+            result = registry.execute("sqlite_query", {"path": "data.db", "query": "select body from notes", "max_rows": 10}, workspace)
+            self.assertFalse(result.is_error, result.stderr)
+            self.assertIn("hello", result.stdout)
+
+            result = registry.execute("sqlite_query", {"path": "data.db", "query": "delete from notes"}, workspace)
+            self.assertTrue(result.is_error)
+            self.assertIn("only allows", result.stderr)
+
+    def test_code_outline_and_symbol_search(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "src").mkdir()
+            (workspace / "src" / "app.py").write_text("class AgentRunner:\n    pass\n\ndef plan_task():\n    pass\n", encoding="utf-8")
+            registry = ToolRegistry()
+
+            result = registry.execute("code_outline", {"path": "src"}, workspace)
+            self.assertFalse(result.is_error, result.stderr)
+            self.assertIn("AgentRunner", result.stdout)
+            self.assertIn("plan_task", result.stdout)
+
+            result = registry.execute("symbol_search", {"query": "runner", "path": "src"}, workspace)
+            self.assertFalse(result.is_error, result.stderr)
+            self.assertIn("AgentRunner", result.stdout)
+
+    def test_run_tests(self) -> None:
+        with TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            registry = ToolRegistry()
+            result = registry.execute("run_tests", {"command": "printf test-ok", "timeout_seconds": 5}, workspace)
+            self.assertFalse(result.is_error, result.stderr)
+            self.assertIn("test-ok", result.stdout)
+
+            result = registry.execute("run_tests", {}, workspace)
+            self.assertTrue(result.is_error)
+            self.assertIn("no test command detected", result.stderr)
 
     def test_http_fetch_blocks_localhost(self) -> None:
         with TemporaryDirectory() as tmp:

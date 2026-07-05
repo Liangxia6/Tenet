@@ -80,6 +80,10 @@ func (r *Router) SearchMemory(ctx context.Context, query string, limit int) ([]s
 	return r.state.SearchMemory(ctx, query, limit)
 }
 
+func (r *Router) SearchMemoryEntries(ctx context.Context, query storage.MemorySearchQuery) ([]storage.MemoryEntry, error) {
+	return r.state.SearchMemoryEntries(ctx, query)
+}
+
 func (r *Router) ForkStream(ctx context.Context, parentStreamID string, forkFromSeq int64, newQuery string) (string, error) {
 	return r.state.ForkStream(ctx, parentStreamID, forkFromSeq, newQuery)
 }

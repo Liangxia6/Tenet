@@ -70,8 +70,14 @@ func InitSchema(db *sql.DB) error {
 			stream_id TEXT NOT NULL,
 			turn_id TEXT,
 			run_id TEXT,
+			workspace TEXT,
 			kind TEXT NOT NULL,
 			content TEXT NOT NULL,
+			summary_level INTEGER NOT NULL DEFAULT 0,
+			source_event_seq INTEGER NOT NULL DEFAULT 0,
+			importance REAL NOT NULL DEFAULT 0,
+			token_estimate INTEGER NOT NULL DEFAULT 0,
+			expires_at TEXT,
 			created_at TEXT NOT NULL DEFAULT (datetime('now'))
 		)`,
 		`CREATE VIRTUAL TABLE IF NOT EXISTS memory_entries_fts USING fts5(
@@ -92,16 +98,66 @@ func InitSchema(db *sql.DB) error {
 		"CREATE INDEX IF NOT EXISTS idx_projection_snapshots_seq ON projection_snapshots(stream_id, stream_seq DESC)",
 		"CREATE INDEX IF NOT EXISTS idx_token_telemetry_task ON token_telemetry(task_id)",
 		"CREATE INDEX IF NOT EXISTS idx_memory_entries_stream ON memory_entries(stream_id, created_at DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_memory_entries_kind ON memory_entries(kind, created_at DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_memory_entries_workspace ON memory_entries(workspace, created_at DESC)",
 	}
 	for _, statement := range statements {
 		if _, err := db.Exec(statement); err != nil {
 			return fmt.Errorf("init schema: %w", err)
 		}
 	}
+	if err := ensureMemoryEntryColumns(db); err != nil {
+		return err
+	}
 	if _, err := db.Exec("INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)", CurrentSchemaVersion); err != nil {
 		return fmt.Errorf("record schema migration: %w", err)
 	}
 	return nil
+}
+
+func ensureMemoryEntryColumns(db *sql.DB) error {
+	columns, err := tableColumns(db, "memory_entries")
+	if err != nil {
+		return err
+	}
+	definitions := map[string]string{
+		"workspace":        "ALTER TABLE memory_entries ADD COLUMN workspace TEXT",
+		"summary_level":    "ALTER TABLE memory_entries ADD COLUMN summary_level INTEGER NOT NULL DEFAULT 0",
+		"source_event_seq": "ALTER TABLE memory_entries ADD COLUMN source_event_seq INTEGER NOT NULL DEFAULT 0",
+		"importance":       "ALTER TABLE memory_entries ADD COLUMN importance REAL NOT NULL DEFAULT 0",
+		"token_estimate":   "ALTER TABLE memory_entries ADD COLUMN token_estimate INTEGER NOT NULL DEFAULT 0",
+		"expires_at":       "ALTER TABLE memory_entries ADD COLUMN expires_at TEXT",
+	}
+	for column, statement := range definitions {
+		if columns[column] {
+			continue
+		}
+		if _, err := db.Exec(statement); err != nil {
+			return fmt.Errorf("add memory_entries.%s: %w", column, err)
+		}
+	}
+	return nil
+}
+
+func tableColumns(db *sql.DB, table string) (map[string]bool, error) {
+	rows, err := db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return nil, fmt.Errorf("inspect table %s: %w", table, err)
+	}
+	defer rows.Close()
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return nil, err
+		}
+		columns[name] = true
+	}
+	return columns, rows.Err()
 }
 
 func AppliedSchemaVersions(db *sql.DB) ([]int, error) {

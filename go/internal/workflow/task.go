@@ -77,6 +77,10 @@ func (r *Registry) Get(name string) (WorkflowFunc, bool) {
 	return fn, ok
 }
 
+// Execute 是 Tenet 后端最核心的运行入口。
+// 它把一次用户输入包装成 Run：获取 session 锁、创建 WorkflowContext、
+// 写入 RunStarted/RunCompleted/RunFailed/RunPaused 事件，并在成功后保存记忆和工作区 checkpoint。
+// 阅读项目时可以把它理解成“Orchestrator 调度一个 Agent 回合”的主函数。
 func Execute(ctx context.Context, store storage.Store, registry *Registry, task *TaskHandle) (*TaskResult, error) {
 	if task == nil {
 		return nil, errors.New("task is required")
@@ -233,11 +237,14 @@ func (task *TaskHandle) saveRunMemory(ctx context.Context, store storage.Store, 
 	sessionSummary := summarizeText(fmt.Sprintf("User: %s\nAssistant: %v", task.Query, result), 1200)
 	if strings.TrimSpace(sessionSummary) != "" {
 		if _, err := store.SaveMemoryEntry(ctx, storage.MemoryEntry{
-			StreamID: task.StreamID,
-			TurnID:   task.TurnID,
-			RunID:    task.RunID,
-			Kind:     "session_summary",
-			Content:  sessionSummary,
+			StreamID:     task.StreamID,
+			TurnID:       task.TurnID,
+			RunID:        task.RunID,
+			Workspace:    task.Workspace,
+			Kind:         "session_summary",
+			Content:      sessionSummary,
+			SummaryLevel: 1,
+			Importance:   0.7,
 		}); err != nil {
 			return err
 		}
@@ -245,11 +252,14 @@ func (task *TaskHandle) saveRunMemory(ctx context.Context, store storage.Store, 
 	workspaceSummary := summarizeText(fmt.Sprintf("Workspace %s after run %s", task.Workspace, task.RunID), 1200)
 	if strings.TrimSpace(workspaceSummary) != "" {
 		if _, err := store.SaveMemoryEntry(ctx, storage.MemoryEntry{
-			StreamID: task.StreamID,
-			TurnID:   task.TurnID,
-			RunID:    task.RunID,
-			Kind:     "workspace_summary",
-			Content:  workspaceSummary,
+			StreamID:     task.StreamID,
+			TurnID:       task.TurnID,
+			RunID:        task.RunID,
+			Workspace:    task.Workspace,
+			Kind:         "workspace_summary",
+			Content:      workspaceSummary,
+			SummaryLevel: 1,
+			Importance:   0.6,
 		}); err != nil {
 			return err
 		}

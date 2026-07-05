@@ -214,7 +214,7 @@ func TestTaskProjectionContexts(t *testing.T) {
 		StreamID:  "task:context",
 		StreamSeq: 1,
 		EventType: "ContextAssembled",
-		Payload:   `{"session_id":"task:context","turn_id":"turn:1","run_id":"run:1","message_count":2,"estimated_tokens":20,"input_chars":80,"token_budget":100,"compacted":true,"omitted_count":1,"included_refs":[{"type":"message","index":1,"role":"user","chars":12}],"omitted_refs":[{"type":"message","index":0,"role":"assistant","chars":30}]}`,
+		Payload:   `{"session_id":"task:context","turn_id":"turn:1","run_id":"run:1","strategy":"coding_debug","message_count":2,"original_tokens":32,"estimated_tokens":20,"input_chars":80,"token_budget":100,"compacted":true,"omitted_count":1,"compression_ratio":0.4,"tokens_saved":12,"primer_count":2,"recent_count":6,"memory_refs":[{"id":"mem:1","kind":"session_summary","source":"sqlite_fts","score":0.9,"reason":"query match"}],"included_refs":[{"type":"message","index":1,"role":"user","chars":12}],"omitted_refs":[{"type":"message","index":0,"role":"assistant","chars":30}]}`,
 	}
 	if err := projection.Apply(event); err != nil {
 		t.Fatalf("apply: %v", err)
@@ -224,11 +224,62 @@ func TestTaskProjectionContexts(t *testing.T) {
 		t.Fatalf("contexts = %+v", view.Contexts)
 	}
 	ctxState := view.Contexts[0]
-	if !ctxState.Compacted || ctxState.OmittedCount != 1 || ctxState.EstimatedTokens != 20 {
+	if !ctxState.Compacted || ctxState.OmittedCount != 1 || ctxState.OriginalTokens != 32 || ctxState.EstimatedTokens != 20 {
 		t.Fatalf("context state = %+v", ctxState)
+	}
+	if ctxState.Strategy != "coding_debug" || ctxState.TokensSaved != 12 || ctxState.PrimerCount != 2 || ctxState.RecentCount != 6 {
+		t.Fatalf("context metadata = %+v", ctxState)
+	}
+	if ctxState.CompressionRatio != 0.4 || len(ctxState.MemoryRefs) != 1 || ctxState.MemoryRefs[0].ID != "mem:1" {
+		t.Fatalf("context memory metadata = %+v", ctxState)
 	}
 	if len(ctxState.IncludedRefs) != 1 || ctxState.IncludedRefs[0].Role != "user" {
 		t.Fatalf("included refs = %+v", ctxState.IncludedRefs)
+	}
+}
+
+func TestTaskProjectionContextCompressionTimeline(t *testing.T) {
+	projection := NewTaskProjection("task:compress", 100)
+	events := []storage.Event{
+		{StreamID: "task:compress", StreamSeq: 1, EventType: "ContextCompressionStarted", Payload: `{"strategy":"coding_debug","original_tokens":100}`},
+		{StreamID: "task:compress", StreamSeq: 2, EventType: "ContextCompressionCompleted", Payload: `{"tokens_saved":60,"compression_ratio":0.6}`},
+	}
+	for _, event := range events {
+		if err := projection.Apply(event); err != nil {
+			t.Fatalf("apply %s: %v", event.EventType, err)
+		}
+	}
+	steps := projection.State().Timeline.Steps
+	if len(steps) != 2 || steps[0].Type != "context_compression_started" || steps[1].Type != "context_compression_completed" {
+		t.Fatalf("steps = %+v", steps)
+	}
+}
+
+func TestTaskProjectionMemoryRetrieval(t *testing.T) {
+	projection := NewTaskProjection("task:memory", 100)
+	events := []storage.Event{
+		{StreamID: "task:memory", StreamSeq: 1, EventType: "MemoryRetrievalStarted", Payload: `{"session_id":"task:memory","turn_id":"turn:1","run_id":"run:1","source":"sqlite_fts","query_hash":"abc","limit":4}`},
+		{StreamID: "task:memory", StreamSeq: 2, EventType: "MemoryRetrievalCompleted", Payload: `{"session_id":"task:memory","turn_id":"turn:1","run_id":"run:1","source":"sqlite_fts","memory_count":1,"memory_refs":[{"id":"1","kind":"workspace_summary","source":"sqlite_fts","score":1}]}`},
+		{StreamID: "task:memory", StreamSeq: 3, EventType: "MemoryInjected", Payload: `{"memory_refs":[{"id":"1","kind":"workspace_summary","source":"sqlite_fts"}]}`},
+	}
+	for _, event := range events {
+		if err := projection.Apply(event); err != nil {
+			t.Fatalf("apply %s: %v", event.EventType, err)
+		}
+	}
+	view := projection.State()
+	if len(view.MemoryRetrievals) != 1 {
+		t.Fatalf("memory retrievals = %+v", view.MemoryRetrievals)
+	}
+	retrieval := view.MemoryRetrievals[0]
+	if retrieval.Status != StatusCompleted || retrieval.MemoryCount != 1 || retrieval.QueryHash != "abc" {
+		t.Fatalf("retrieval = %+v", retrieval)
+	}
+	if len(retrieval.MemoryRefs) != 1 || retrieval.MemoryRefs[0].ID != "1" {
+		t.Fatalf("memory refs = %+v", retrieval.MemoryRefs)
+	}
+	if len(view.Timeline.Steps) != 3 || view.Timeline.Steps[2].Type != "memory_injected" {
+		t.Fatalf("timeline = %+v", view.Timeline.Steps)
 	}
 }
 

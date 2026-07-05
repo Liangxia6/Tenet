@@ -427,6 +427,84 @@ func TestWorkflowCreatesSummaryMemoryEvents(t *testing.T) {
 	}
 }
 
+func TestWorkflowRetrievesAndInjectsMemory(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	store := testStore(t)
+	defer store.Close()
+	workspace := t.TempDir()
+	if _, err := store.SaveMemoryEntry(ctx, storage.MemoryEntry{
+		StreamID:  "task:memory-inject",
+		Workspace: workspace,
+		Kind:      "workspace_summary",
+		Content:   "parser bug was fixed by updating the context assembler memory path",
+	}); err != nil {
+		t.Fatalf("save memory: %v", err)
+	}
+	client := &scriptedGenerator{responses: []worker.GenerateThoughtResponse{{
+		Thought: "done",
+		IsFinal: true,
+	}}}
+	cfg := config.Default()
+	cfg.Workflow.RecordBatchSize = 20
+	if _, err := Execute(ctx, store, NewRegistry(), &TaskHandle{
+		StreamID:     "task:memory-inject",
+		WorkflowType: "simple",
+		SessionID:    "task:memory-inject",
+		Query:        "parser bug",
+		Workspace:    workspace,
+		Config:       cfg,
+		Client:       client,
+	}); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if len(client.requests) != 1 {
+		t.Fatalf("requests = %+v", client.requests)
+	}
+	foundMemoryMessage := false
+	for _, message := range client.requests[0].Messages {
+		if message.Role == "system" && strings.Contains(message.Content, "Retrieved memories") && strings.Contains(message.Content, "parser bug was fixed") {
+			foundMemoryMessage = true
+		}
+	}
+	if !foundMemoryMessage {
+		t.Fatalf("messages = %+v", client.requests[0].Messages)
+	}
+	events, err := store.Read("task:memory-inject", 1)
+	if err != nil {
+		t.Fatalf("read events: %v", err)
+	}
+	seen := map[string]bool{}
+	contextHasMemoryRef := false
+	for _, event := range events {
+		seen[event.EventType] = true
+		if event.EventType != "ContextAssembled" {
+			continue
+		}
+		var payload struct {
+			MemoryRefs []struct {
+				ID     string `json:"id"`
+				Source string `json:"source"`
+			} `json:"memory_refs"`
+		}
+		if err := json.Unmarshal([]byte(event.Payload), &payload); err != nil {
+			t.Fatalf("decode context payload: %v", err)
+		}
+		contextHasMemoryRef = len(payload.MemoryRefs) == 1 && payload.MemoryRefs[0].Source == "sqlite_fts"
+	}
+	for _, want := range []string{"MemoryRetrievalStarted", "MemoryRetrievalCompleted", "MemoryInjected"} {
+		if !seen[want] {
+			t.Fatalf("missing %s in %+v", want, events)
+		}
+	}
+	if !contextHasMemoryRef {
+		t.Fatalf("ContextAssembled did not include memory refs: %+v", events)
+	}
+	if _, err := Replay(ctx, store, NewRegistry(), &TaskHandle{StreamID: "task:memory-inject", Config: cfg}); err != nil {
+		t.Fatalf("replay memory injection: %v", err)
+	}
+}
+
 func TestReactWorkflowValidatesAndPassesFencingTokenToTool(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

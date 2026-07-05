@@ -4,10 +4,13 @@ import json
 import os
 import fnmatch
 import ipaddress
+import re
 import socket
+import sqlite3
 import urllib.parse
 import urllib.request
 import subprocess
+import tarfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +27,12 @@ class ToolResult:
 
 
 class ToolRegistry:
+    """Python 侧内置工具注册表。
+
+    工具定义从 tools/builtin_tools.json 加载，handler 在这里注册。
+    Go/Python 两侧共用 manifest，可以减少“模型看到的 schema”和“实际可执行工具”漂移。
+    """
+
     def __init__(self, dangerous_patterns: list[str] | None = None) -> None:
         self.dangerous_patterns = dangerous_patterns or ["rm -rf /", "mkfs.", "dd if=", ":(){ :|:& };:"]
         self._tools: dict[str, Callable[[dict[str, Any], Path], ToolResult]] = {
@@ -42,11 +51,19 @@ class ToolRegistry:
             "git_log": self._git_log,
             "git_show": self._git_show,
             "git_branch": self._git_branch,
+            "workspace_snapshot": self._workspace_snapshot,
+            "workspace_restore": self._workspace_restore,
             "http_fetch": self._http_fetch,
+            "sqlite_query": self._sqlite_query,
+            "symbol_search": self._symbol_search,
+            "code_outline": self._code_outline,
+            "run_tests": self._run_tests,
             "web_search": self._web_search,
         }
 
     def execute(self, tool_name: str, arguments: str | dict[str, Any], workspace: str | os.PathLike[str]) -> ToolResult:
+        # 统一执行入口：解析 JSON、按 manifest 做参数校验，再调用具体 handler。
+        # handler 抛出的异常会被转成 ToolResult，避免 gRPC 直接崩掉。
         tool = self._tools.get(tool_name)
         if tool is None:
             return ToolResult(stderr=f"unknown tool: {tool_name}", exit_code=1, is_error=True)
@@ -237,6 +254,15 @@ class ToolRegistry:
             is_error=completed.returncode != 0,
         )
 
+    def _run_tests(self, args: dict[str, Any], workspace: Path) -> ToolResult:
+        command = str(args.get("command", "")).strip()
+        if not command:
+            command = _detect_test_command(workspace)
+            if not command:
+                return ToolResult(stderr="no test command detected; pass command explicitly", exit_code=1, is_error=True)
+        timeout = _bounded_int(args.get("timeout_seconds", 300), 1, 1200)
+        return self._shell({"command": command, "timeout_seconds": timeout}, workspace)
+
     def _web_search(self, args: dict[str, Any], workspace: Path) -> ToolResult:
         del workspace
         query = str(args.get("query", ""))
@@ -306,6 +332,35 @@ class ToolRegistry:
             return _run_git(workspace, ["branch", "--all", "--verbose"], _bounded_int(args.get("max_bytes", 60000), 1, 200000))
         return _run_git(workspace, ["branch", "--show-current"], _bounded_int(args.get("max_bytes", 60000), 1, 200000))
 
+    def _workspace_snapshot(self, args: dict[str, Any], workspace: Path) -> ToolResult:
+        root = workspace.resolve()
+        label = str(args.get("label", "snapshot") or "snapshot")
+        backup_dir = root / ".backup" / "tool-snapshots"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        ref = backup_dir / f"{time.time_ns()}-{_safe_archive_name(label)}.tar.gz"
+        with tarfile.open(ref, "w:gz") as archive:
+            for item in root.rglob("*"):
+                if item == ref or _should_skip(item):
+                    continue
+                archive.add(item, arcname=item.relative_to(root), recursive=False)
+        return ToolResult(stdout=json.dumps({"snapshot_type": "archive", "snapshot_ref": str(ref.relative_to(root))}))
+
+    def _workspace_restore(self, args: dict[str, Any], workspace: Path) -> ToolResult:
+        ref = str(args.get("snapshot_ref", ""))
+        archive_path = _safe_path(workspace, ref)
+        root = workspace.resolve()
+        if bool(args.get("clean", False)):
+            _clean_workspace_for_restore(root, archive_path)
+        with tarfile.open(archive_path, "r:gz") as archive:
+            for member in archive.getmembers():
+                target = (root / member.name).resolve()
+                try:
+                    target.relative_to(root)
+                except ValueError as exc:
+                    raise PermissionError(f"archive path escapes workspace: {member.name}") from exc
+                archive.extract(member, root)
+        return ToolResult(stdout=json.dumps({"restored": True, "snapshot_ref": ref}))
+
     def _http_fetch(self, args: dict[str, Any], workspace: Path) -> ToolResult:
         del workspace
         url = str(args.get("url", ""))
@@ -328,6 +383,113 @@ class ToolRegistry:
                 "body": data.decode("utf-8", errors="replace"),
                 "truncated": truncated,
             }))
+
+    def _sqlite_query(self, args: dict[str, Any], workspace: Path) -> ToolResult:
+        db_path = _safe_path(workspace, str(args.get("path", "")))
+        query = str(args.get("query", ""))
+        error = _validate_read_only_sqlite_query(query)
+        if error:
+            return ToolResult(stderr=error, exit_code=1, is_error=True)
+        max_rows = _bounded_int(args.get("max_rows", 100), 1, 1000)
+        uri = f"file:{db_path}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=10) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(query)
+            rows = []
+            for row in cursor.fetchmany(max_rows):
+                rows.append({key: row[key] for key in row.keys()})
+            columns = [item[0] for item in cursor.description or []]
+        return ToolResult(stdout=json.dumps({"columns": columns, "rows": rows, "truncated": len(rows) >= max_rows}))
+
+    def _symbol_search(self, args: dict[str, Any], workspace: Path) -> ToolResult:
+        query = str(args.get("query", "")).strip().lower()
+        if not query:
+            return ToolResult(stderr="query is required", exit_code=1, is_error=True)
+        root = _safe_path(workspace, str(args.get("path", ".")))
+        max_results = _bounded_int(args.get("max_results", 100), 1, 1000)
+        matches: list[dict[str, Any]] = []
+        files = [root] if root.is_file() else list(root.rglob("*"))
+        for item in files:
+            if len(matches) >= max_results:
+                break
+            if _should_skip(item) or item.is_dir() or not _looks_like_code_file(item):
+                continue
+            try:
+                content = item.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            for symbol in _outline_symbols(workspace.resolve(), item, content, max_results - len(matches)):
+                if query in str(symbol["name"]).lower():
+                    matches.append(symbol)
+                    if len(matches) >= max_results:
+                        break
+        return ToolResult(stdout=json.dumps({"matches": matches, "truncated": len(matches) >= max_results}))
+
+    def _code_outline(self, args: dict[str, Any], workspace: Path) -> ToolResult:
+        root = _safe_path(workspace, str(args.get("path", ".")))
+        max_symbols = _bounded_int(args.get("max_symbols", 500), 1, 2000)
+        symbols: list[dict[str, Any]] = []
+        files = [root] if root.is_file() else list(root.rglob("*"))
+        for item in files:
+            if len(symbols) >= max_symbols:
+                break
+            if _should_skip(item) or item.is_dir() or not _looks_like_code_file(item):
+                continue
+            try:
+                content = item.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            symbols.extend(_outline_symbols(workspace.resolve(), item, content, max_symbols - len(symbols)))
+        return ToolResult(stdout=json.dumps({"symbols": symbols, "truncated": len(symbols) >= max_symbols}))
+
+
+_CODE_OUTLINE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("function", re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)")),
+    ("function", re.compile(r"^\s*func\s+(?:\([^)]+\)\s*)?([A-Za-z_][A-Za-z0-9_]*)")),
+    ("function", re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)")),
+    ("class", re.compile(r"^\s*(?:export\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)")),
+    ("class", re.compile(r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)")),
+    ("type", re.compile(r"^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)\s+(?:struct|interface|=)")),
+    ("interface", re.compile(r"^\s*(?:export\s+)?interface\s+([A-Za-z_][A-Za-z0-9_]*)")),
+    ("constant", re.compile(r"^\s*(?:export\s+)?const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=")),
+]
+
+
+def _looks_like_code_file(path: Path) -> bool:
+    return path.suffix.lower() in {".go", ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".kt", ".rs", ".c", ".h", ".cpp", ".hpp", ".cs", ".rb", ".php", ".swift"}
+
+
+def _outline_symbols(workspace: Path, path: Path, content: str, limit: int) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    try:
+        rel = str(path.relative_to(workspace))
+    except ValueError:
+        rel = str(path)
+    symbols: list[dict[str, Any]] = []
+    for index, line in enumerate(content.splitlines(), start=1):
+        for kind, pattern in _CODE_OUTLINE_PATTERNS:
+            match = pattern.search(line)
+            if not match:
+                continue
+            symbols.append({"name": match.group(1).lstrip("*").strip(), "kind": kind, "path": rel, "line": index})
+            if len(symbols) >= limit:
+                return symbols
+            break
+    return symbols
+
+
+def _detect_test_command(workspace: Path) -> str:
+    root = workspace.resolve()
+    for filename, command in (
+        ("go.mod", "go test ./..."),
+        ("package.json", "npm test"),
+        ("pyproject.toml", "python -m pytest"),
+        ("pytest.ini", "python -m pytest"),
+    ):
+        if (root / filename).exists():
+            return command
+    return ""
 
 
 def _load_tool_manifest() -> list[dict[str, str]]:
@@ -461,6 +623,28 @@ def _validate_patch_paths(workspace: Path, patch_text: str) -> None:
         _safe_path(workspace, path)
 
 
+def _clean_workspace_for_restore(root: Path, keep_archive: Path) -> None:
+    for item in sorted(root.rglob("*"), key=lambda path: len(path.parts), reverse=True):
+        if item == keep_archive or keep_archive.is_relative_to(item):
+            continue
+        if ".backup" in item.parts:
+            continue
+        if item.is_file() or item.is_symlink():
+            item.unlink()
+        elif item.is_dir():
+            try:
+                item.rmdir()
+            except OSError:
+                pass
+
+
+def _safe_archive_name(value: str) -> str:
+    value = value.strip() or "snapshot"
+    for char in ("/", "\\", " ", ":", "\x00"):
+        value = value.replace(char, "-")
+    return value[:80]
+
+
 def _run_git(workspace: Path, args: list[str], max_bytes: int) -> ToolResult:
     completed = subprocess.run(
         ["git", *args],
@@ -501,8 +685,25 @@ def _validate_fetch_url(url: str) -> None:
             raise PermissionError(f"refusing to fetch private or local address: {ip}")
 
 
+def _validate_read_only_sqlite_query(query: str) -> str | None:
+    trimmed = query.strip()
+    if not trimmed:
+        return "query is required"
+    without_trailing = trimmed[:-1] if trimmed.endswith(";") else trimmed
+    if ";" in without_trailing:
+        return "sqlite_query allows a single read-only statement"
+    lower = without_trailing.strip().lower()
+    if not (lower.startswith("select ") or lower.startswith("with ") or lower.startswith("pragma ")):
+        return "sqlite_query only allows SELECT, WITH, or PRAGMA statements"
+    padded = f" {lower} "
+    for keyword in (" insert ", " update ", " delete ", " drop ", " alter ", " create ", " attach ", " detach ", " replace ", " vacuum "):
+        if keyword in padded:
+            return f"sqlite_query is read-only; blocked keyword {keyword.strip()}"
+    return None
+
+
 def _should_skip(path: Path) -> bool:
-    return any(part in {".git", "node_modules", ".venv", "dist", "build", "__pycache__"} for part in path.parts)
+    return any(part in {".git", ".backup", "node_modules", ".venv", "dist", "build", "__pycache__"} for part in path.parts)
 
 
 def _bounded_int(value: Any, minimum: int, maximum: int) -> int:

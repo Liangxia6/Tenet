@@ -1,7 +1,10 @@
 package worker
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,15 +16,36 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
+// LocalToolExecutor 是 Tenet 内置工具运行时。
+// 它只允许访问 workspace 内部路径，并在执行前做 schema validation、allowlist 校验、
+// SSRF 防护、危险 shell 命令拦截等安全检查。
+// Go 本地模式、OpenAI/DeepSeek 本地工具模式都会经过这里。
 type LocalToolExecutor struct {
 	Workspace         string
 	DangerousPatterns []string
 	ToolAllowlist     []string
+}
+
+var codeOutlinePatterns = []struct {
+	kind string
+	re   *regexp.Regexp
+}{
+	{"function", regexp.MustCompile(`^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)`)},
+	{"function", regexp.MustCompile(`^\s*func\s+(?:\([^)]+\)\s*)?([A-Za-z_][A-Za-z0-9_]*)`)},
+	{"function", regexp.MustCompile(`^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)`)},
+	{"class", regexp.MustCompile(`^\s*(?:export\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)`)},
+	{"class", regexp.MustCompile(`^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)`)},
+	{"type", regexp.MustCompile(`^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)\s+(?:struct|interface|=)`)},
+	{"interface", regexp.MustCompile(`^\s*(?:export\s+)?interface\s+([A-Za-z_][A-Za-z0-9_]*)`)},
+	{"constant", regexp.MustCompile(`^\s*(?:export\s+)?const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=`)},
 }
 
 func BuiltinToolDefinitions() []ToolDefinition {
@@ -430,8 +454,20 @@ func (e *LocalToolExecutor) execute(ctx context.Context, workspace, toolName, ra
 		return e.gitShow(ctx, workspace, args)
 	case "git_branch":
 		return e.gitBranch(ctx, workspace, args)
+	case "workspace_snapshot":
+		return e.workspaceSnapshot(workspace, args)
+	case "workspace_restore":
+		return e.workspaceRestore(workspace, args)
 	case "http_fetch":
 		return e.httpFetch(ctx, args)
+	case "sqlite_query":
+		return e.sqliteQuery(ctx, workspace, args)
+	case "symbol_search":
+		return e.symbolSearch(workspace, args)
+	case "code_outline":
+		return e.codeOutline(workspace, args)
+	case "run_tests":
+		return e.runTests(ctx, workspace, args)
 	case "web_search":
 		return ExecuteToolResponse{
 			Stdout:   `{"status":"TODO","results":[]}`,
@@ -763,6 +799,25 @@ func (e *LocalToolExecutor) shell(ctx context.Context, workspace string, args ma
 	return ExecuteToolResponse{Stdout: string(out), ExitCode: 0}
 }
 
+func (e *LocalToolExecutor) runTests(ctx context.Context, workspace string, args map[string]any) ExecuteToolResponse {
+	command, _ := args["command"].(string)
+	if strings.TrimSpace(command) == "" {
+		detected, err := detectTestCommand(workspace)
+		if err != nil {
+			return toolError(err.Error(), 1)
+		}
+		command = detected
+	}
+	timeout := intArg(args, "timeout_seconds", 300)
+	if timeout < 1 {
+		timeout = 300
+	}
+	if timeout > 1200 {
+		timeout = 1200
+	}
+	return e.shell(ctx, workspace, map[string]any{"command": command, "timeout_seconds": timeout})
+}
+
 func (e *LocalToolExecutor) gitStatus(ctx context.Context, workspace string) ExecuteToolResponse {
 	return e.shell(ctx, workspace, map[string]any{"command": "git status --short", "timeout_seconds": 30})
 }
@@ -856,6 +911,51 @@ func (e *LocalToolExecutor) gitBranch(ctx context.Context, workspace string, arg
 	return runGit(ctx, workspace, []string{"branch", "--show-current"}, boundedMaxBytes(args))
 }
 
+func (e *LocalToolExecutor) workspaceSnapshot(workspace string, args map[string]any) ExecuteToolResponse {
+	root, err := canonicalWorkspaceRoot(workspace)
+	if err != nil {
+		return toolError(err.Error(), 1)
+	}
+	label, _ := args["label"].(string)
+	if strings.TrimSpace(label) == "" {
+		label = "snapshot"
+	}
+	backupDir := filepath.Join(root, ".backup", "tool-snapshots")
+	if err := os.MkdirAll(backupDir, 0755); err != nil {
+		return toolError(err.Error(), 1)
+	}
+	ref := filepath.Join(backupDir, fmt.Sprintf("%d-%s.tar.gz", time.Now().UTC().UnixNano(), safeArchiveName(label)))
+	if err := createWorkspaceArchive(root, ref); err != nil {
+		return toolError(err.Error(), 1)
+	}
+	rel, _ := filepath.Rel(root, ref)
+	return jsonResponse(map[string]any{"snapshot_type": "archive", "snapshot_ref": rel})
+}
+
+func (e *LocalToolExecutor) workspaceRestore(workspace string, args map[string]any) ExecuteToolResponse {
+	ref, _ := args["snapshot_ref"].(string)
+	if strings.TrimSpace(ref) == "" {
+		return toolError("snapshot_ref is required", 1)
+	}
+	root, err := canonicalWorkspaceRoot(workspace)
+	if err != nil {
+		return toolError(err.Error(), 1)
+	}
+	archivePath, err := safeWorkspacePath(workspace, ref, true)
+	if err != nil {
+		return toolError(err.Error(), 1)
+	}
+	if boolArg(args, "clean", false) {
+		if err := cleanWorkspaceForRestore(root, archivePath); err != nil {
+			return toolError(err.Error(), 1)
+		}
+	}
+	if err := extractWorkspaceArchive(root, archivePath); err != nil {
+		return toolError(err.Error(), 1)
+	}
+	return jsonResponse(map[string]any{"restored": true, "snapshot_ref": ref})
+}
+
 func (e *LocalToolExecutor) httpFetch(ctx context.Context, args map[string]any) ExecuteToolResponse {
 	rawURL, _ := args["url"].(string)
 	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
@@ -923,6 +1023,29 @@ func blockedFetchIP(ip net.IP) bool {
 		ip.IsLinkLocalMulticast() ||
 		ip.IsMulticast() ||
 		ip.IsUnspecified()
+}
+
+func validateReadOnlySQLiteQuery(query string) error {
+	trimmed := strings.TrimSpace(query)
+	if trimmed == "" {
+		return errors.New("query is required")
+	}
+	withoutTrailingSemicolon := strings.TrimSuffix(trimmed, ";")
+	if strings.Contains(withoutTrailingSemicolon, ";") {
+		return errors.New("sqlite_query allows a single read-only statement")
+	}
+	lower := strings.ToLower(strings.TrimSpace(withoutTrailingSemicolon))
+	if strings.HasPrefix(lower, "select ") || strings.HasPrefix(lower, "with ") || strings.HasPrefix(lower, "pragma ") {
+		blocked := []string{" insert ", " update ", " delete ", " drop ", " alter ", " create ", " attach ", " detach ", " replace ", " vacuum "}
+		padded := " " + lower + " "
+		for _, keyword := range blocked {
+			if strings.Contains(padded, keyword) {
+				return fmt.Errorf("sqlite_query is read-only; blocked keyword %s", strings.TrimSpace(keyword))
+			}
+		}
+		return nil
+	}
+	return errors.New("sqlite_query only allows SELECT, WITH, or PRAGMA statements")
 }
 
 func runGit(ctx context.Context, workspace string, args []string, maxBytes int) ExecuteToolResponse {
@@ -1012,6 +1135,371 @@ func safeWorkspacePath(workspace, userPath string, mustExist bool) (string, erro
 	return candidate, nil
 }
 
+func createWorkspaceArchive(root, archivePath string) error {
+	file, err := os.Create(archivePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	gzw := gzip.NewWriter(file)
+	defer gzw.Close()
+	tw := tar.NewWriter(gzw)
+	defer tw.Close()
+	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == archivePath {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil || rel == "." {
+			return err
+		}
+		if shouldSkipToolDir(d.Name()) && d.IsDir() {
+			return filepath.SkipDir
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		header, err := tar.FileInfoHeader(info, "")
+		if err != nil {
+			return err
+		}
+		header.Name = rel
+		if err := tw.WriteHeader(header); err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		source, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer source.Close()
+		_, err = io.Copy(tw, source)
+		return err
+	})
+}
+
+func (e *LocalToolExecutor) sqliteQuery(ctx context.Context, workspace string, args map[string]any) ExecuteToolResponse {
+	path, _ := args["path"].(string)
+	query, _ := args["query"].(string)
+	if err := validateReadOnlySQLiteQuery(query); err != nil {
+		return toolError(err.Error(), 1)
+	}
+	dbPath, err := safeWorkspacePath(workspace, path, true)
+	if err != nil {
+		return toolError(err.Error(), 1)
+	}
+	db, err := sql.Open("sqlite", "file:"+dbPath+"?mode=ro")
+	if err != nil {
+		return toolError(err.Error(), 1)
+	}
+	defer db.Close()
+	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	rows, err := db.QueryContext(queryCtx, query)
+	if err != nil {
+		return toolError(err.Error(), 1)
+	}
+	defer rows.Close()
+	columns, err := rows.Columns()
+	if err != nil {
+		return toolError(err.Error(), 1)
+	}
+	maxRows := intArg(args, "max_rows", 100)
+	if maxRows <= 0 || maxRows > 1000 {
+		maxRows = 100
+	}
+	outRows := []map[string]any{}
+	for rows.Next() {
+		if len(outRows) >= maxRows {
+			break
+		}
+		values := make([]any, len(columns))
+		ptrs := make([]any, len(columns))
+		for i := range values {
+			ptrs[i] = &values[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return toolError(err.Error(), 1)
+		}
+		item := map[string]any{}
+		for i, column := range columns {
+			value := values[i]
+			if data, ok := value.([]byte); ok {
+				value = string(data)
+			}
+			item[column] = value
+		}
+		outRows = append(outRows, item)
+	}
+	if err := rows.Err(); err != nil {
+		return toolError(err.Error(), 1)
+	}
+	return jsonResponse(map[string]any{"columns": columns, "rows": outRows, "truncated": len(outRows) >= maxRows})
+}
+
+func (e *LocalToolExecutor) symbolSearch(workspace string, args map[string]any) ExecuteToolResponse {
+	query, _ := args["query"].(string)
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return toolError("query is required", 1)
+	}
+	base, _ := args["path"].(string)
+	if base == "" {
+		base = "."
+	}
+	root, err := safeWorkspacePath(workspace, base, true)
+	if err != nil {
+		return toolError(err.Error(), 1)
+	}
+	maxResults := intArg(args, "max_results", 100)
+	if maxResults <= 0 || maxResults > 1000 {
+		maxResults = 100
+	}
+	workspaceRoot := mustAbs(workspace)
+	needle := strings.ToLower(query)
+	matches := []map[string]any{}
+	err = filepath.WalkDir(root, func(current string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if shouldSkipToolDir(d.Name()) && d.IsDir() {
+			return filepath.SkipDir
+		}
+		if d.IsDir() || len(matches) >= maxResults || !looksLikeCodeFile(current) {
+			return nil
+		}
+		data, err := os.ReadFile(current)
+		if err != nil || len(data) > 2*1024*1024 || strings.ContainsRune(string(data[:min(len(data), 8000)]), '\x00') {
+			return nil
+		}
+		for _, symbol := range outlineSymbols(workspaceRoot, current, string(data), maxResults-len(matches)) {
+			name, _ := symbol["name"].(string)
+			if strings.Contains(strings.ToLower(name), needle) {
+				matches = append(matches, symbol)
+				if len(matches) >= maxResults {
+					return filepath.SkipAll
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return toolError(err.Error(), 1)
+	}
+	return jsonResponse(map[string]any{"matches": matches, "truncated": len(matches) >= maxResults})
+}
+
+func (e *LocalToolExecutor) codeOutline(workspace string, args map[string]any) ExecuteToolResponse {
+	base, _ := args["path"].(string)
+	if base == "" {
+		base = "."
+	}
+	root, err := safeWorkspacePath(workspace, base, true)
+	if err != nil {
+		return toolError(err.Error(), 1)
+	}
+	maxSymbols := intArg(args, "max_symbols", 500)
+	if maxSymbols <= 0 || maxSymbols > 2000 {
+		maxSymbols = 500
+	}
+	workspaceRoot := mustAbs(workspace)
+	symbols := []map[string]any{}
+	info, err := os.Stat(root)
+	if err != nil {
+		return toolError(err.Error(), 1)
+	}
+	if !info.IsDir() {
+		data, err := os.ReadFile(root)
+		if err != nil {
+			return toolError(err.Error(), 1)
+		}
+		return jsonResponse(map[string]any{"symbols": outlineSymbols(workspaceRoot, root, string(data), maxSymbols), "truncated": false})
+	}
+	err = filepath.WalkDir(root, func(current string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if shouldSkipToolDir(d.Name()) && d.IsDir() {
+			return filepath.SkipDir
+		}
+		if d.IsDir() || len(symbols) >= maxSymbols || !looksLikeCodeFile(current) {
+			return nil
+		}
+		data, err := os.ReadFile(current)
+		if err != nil || len(data) > 2*1024*1024 || strings.ContainsRune(string(data[:min(len(data), 8000)]), '\x00') {
+			return nil
+		}
+		symbols = append(symbols, outlineSymbols(workspaceRoot, current, string(data), maxSymbols-len(symbols))...)
+		if len(symbols) >= maxSymbols {
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if err != nil {
+		return toolError(err.Error(), 1)
+	}
+	return jsonResponse(map[string]any{"symbols": symbols, "truncated": len(symbols) >= maxSymbols})
+}
+
+func extractWorkspaceArchive(root, archivePath string) error {
+	file, err := os.Open(archivePath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	gzr, err := gzip.NewReader(file)
+	if err != nil {
+		return err
+	}
+	defer gzr.Close()
+	tr := tar.NewReader(gzr)
+	for {
+		header, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(root, filepath.Clean(header.Name))
+		rel, err := filepath.Rel(root, target)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+			return fmt.Errorf("archive path escapes workspace: %s", header.Name)
+		}
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, os.FileMode(header.Mode)); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				return err
+			}
+			out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode))
+			if err != nil {
+				return err
+			}
+			_, copyErr := io.Copy(out, tr)
+			closeErr := out.Close()
+			if copyErr != nil {
+				return copyErr
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+		}
+	}
+}
+
+func cleanWorkspaceForRestore(root, keepArchive string) error {
+	return filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == root {
+			return nil
+		}
+		if path == keepArchive || strings.HasPrefix(keepArchive, path+string(filepath.Separator)) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if d.IsDir() && d.Name() == ".backup" {
+			return filepath.SkipDir
+		}
+		if d.IsDir() {
+			return nil
+		}
+		return os.Remove(path)
+	})
+}
+
+func safeArchiveName(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "snapshot"
+	}
+	replacer := strings.NewReplacer("/", "-", "\\", "-", " ", "-", ":", "-", "\x00", "")
+	value = replacer.Replace(value)
+	if len(value) > 80 {
+		value = value[:80]
+	}
+	return value
+}
+
+func looksLikeCodeFile(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".go", ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".kt", ".rs", ".c", ".h", ".cpp", ".hpp", ".cs", ".rb", ".php", ".swift":
+		return true
+	default:
+		return false
+	}
+}
+
+func outlineSymbols(workspaceRoot, filePath, content string, limit int) []map[string]any {
+	if limit <= 0 {
+		return nil
+	}
+	rel, err := filepath.Rel(workspaceRoot, filePath)
+	if err != nil {
+		rel = filePath
+	}
+	symbols := []map[string]any{}
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		for _, pattern := range codeOutlinePatterns {
+			matches := pattern.re.FindStringSubmatch(line)
+			if len(matches) < 2 {
+				continue
+			}
+			symbols = append(symbols, map[string]any{
+				"name": patternSymbolName(matches[1]),
+				"kind": pattern.kind,
+				"path": rel,
+				"line": i + 1,
+			})
+			if len(symbols) >= limit {
+				return symbols
+			}
+			break
+		}
+	}
+	return symbols
+}
+
+func patternSymbolName(name string) string {
+	return strings.TrimSpace(strings.TrimPrefix(name, "*"))
+}
+
+func detectTestCommand(workspace string) (string, error) {
+	root, err := canonicalWorkspaceRoot(workspace)
+	if err != nil {
+		return "", err
+	}
+	candidates := []struct {
+		file    string
+		command string
+	}{
+		{"go.mod", "go test ./..."},
+		{"package.json", "npm test"},
+		{"pyproject.toml", "python -m pytest"},
+		{"pytest.ini", "python -m pytest"},
+	}
+	for _, candidate := range candidates {
+		if _, err := os.Stat(filepath.Join(root, candidate.file)); err == nil {
+			return candidate.command, nil
+		}
+	}
+	return "", errors.New("no test command detected; pass command explicitly")
+}
+
 func canonicalWorkspaceRoot(workspace string) (string, error) {
 	root, err := filepath.Abs(workspace)
 	if err != nil {
@@ -1074,7 +1562,7 @@ func jsonResponse(payload any) ExecuteToolResponse {
 
 func shouldSkipToolDir(name string) bool {
 	switch name {
-	case ".git", "node_modules", ".venv", "dist", "build", "__pycache__":
+	case ".git", ".backup", "node_modules", ".venv", "dist", "build", "__pycache__":
 		return true
 	default:
 		return false

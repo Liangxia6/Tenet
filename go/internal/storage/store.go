@@ -35,6 +35,7 @@ type Store interface {
 	LatestProjectionSnapshot(streamID string) (ProjectionSnapshot, error)
 	SaveMemoryEntry(ctx context.Context, entry MemoryEntry) (MemoryEntry, error)
 	SearchMemory(ctx context.Context, query string, limit int) ([]MemoryEntry, error)
+	SearchMemoryEntries(ctx context.Context, query MemorySearchQuery) ([]MemoryEntry, error)
 	ForkStream(ctx context.Context, parentStreamID string, forkFromSeq int64, newQuery string) (string, error)
 	GetLineage(streamID string) ([]string, error)
 	GetChildStreams(streamID string) ([]string, error)
@@ -70,13 +71,28 @@ type ProjectionSnapshot struct {
 }
 
 type MemoryEntry struct {
-	ID        int64
-	StreamID  string
-	TurnID    string
-	RunID     string
-	Kind      string
-	Content   string
-	CreatedAt time.Time
+	ID             int64
+	StreamID       string
+	TurnID         string
+	RunID          string
+	Workspace      string
+	Kind           string
+	Content        string
+	SummaryLevel   int
+	SourceEventSeq int64
+	Importance     float64
+	TokenEstimate  int
+	ExpiresAt      time.Time
+	CreatedAt      time.Time
+}
+
+type MemorySearchQuery struct {
+	Query          string
+	Limit          int
+	StreamID       string
+	Workspace      string
+	Kinds          []string
+	IncludeExpired bool
 }
 
 type AppendEvent struct {
@@ -107,6 +123,10 @@ type SQLiteStore struct {
 	wg        sync.WaitGroup
 }
 
+// SQLiteStore 是当前 MVP 的持久化事件库。
+// 所有写入通过单写队列串行化，避免 SQLite 多写竞争。
+// AppendEvents 会统一补 schema_version 并做 secret redaction，
+// 上层 workflow 不需要在每个事件里重复处理这些横切逻辑。
 type writeJob struct {
 	req    *WriteRequest
 	append *appendJob
@@ -372,10 +392,13 @@ func (s *SQLiteStore) SaveMemoryEntry(ctx context.Context, entry MemoryEntry) (M
 	if strings.TrimSpace(entry.Content) == "" {
 		return MemoryEntry{}, fmt.Errorf("memory content is required")
 	}
+	if entry.TokenEstimate <= 0 {
+		entry.TokenEstimate = estimateMemoryTokens(entry.Content)
+	}
 	result, err := s.Append(ctx, &WriteRequest{Statements: []WriteStatement{{
-		SQL: `INSERT INTO memory_entries(stream_id, turn_id, run_id, kind, content)
-			VALUES(?,?,?,?,?)`,
-		Args: []any{entry.StreamID, entry.TurnID, entry.RunID, entry.Kind, entry.Content},
+		SQL: `INSERT INTO memory_entries(stream_id, turn_id, run_id, workspace, kind, content, summary_level, source_event_seq, importance, token_estimate, expires_at)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+		Args: []any{entry.StreamID, entry.TurnID, entry.RunID, entry.Workspace, entry.Kind, entry.Content, entry.SummaryLevel, entry.SourceEventSeq, entry.Importance, entry.TokenEstimate, sqliteTimeOrNil(entry.ExpiresAt)},
 	}}})
 	if err != nil {
 		return MemoryEntry{}, err
@@ -392,20 +415,49 @@ func (s *SQLiteStore) SaveMemoryEntry(ctx context.Context, entry MemoryEntry) (M
 }
 
 func (s *SQLiteStore) SearchMemory(ctx context.Context, query string, limit int) ([]MemoryEntry, error) {
-	if strings.TrimSpace(query) == "" {
+	return s.SearchMemoryEntries(ctx, MemorySearchQuery{Query: query, Limit: limit})
+}
+
+func (s *SQLiteStore) SearchMemoryEntries(ctx context.Context, query MemorySearchQuery) ([]MemoryEntry, error) {
+	if strings.TrimSpace(query.Query) == "" {
 		return nil, fmt.Errorf("query is required")
 	}
+	limit := query.Limit
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT m.id, m.stream_id, m.turn_id, m.run_id, m.kind, m.content, m.created_at
+	where := []string{"memory_entries_fts MATCH ?"}
+	args := []any{query.Query}
+	if query.StreamID != "" {
+		where = append(where, "m.stream_id = ?")
+		args = append(args, query.StreamID)
+	}
+	if query.Workspace != "" {
+		where = append(where, "m.workspace = ?")
+		args = append(args, query.Workspace)
+	}
+	kinds := compactStrings(query.Kinds)
+	if len(kinds) > 0 {
+		placeholders := make([]string, len(kinds))
+		for i, kind := range kinds {
+			placeholders[i] = "?"
+			args = append(args, kind)
+		}
+		where = append(where, "m.kind IN ("+strings.Join(placeholders, ",")+")")
+	}
+	if !query.IncludeExpired {
+		where = append(where, "(m.expires_at IS NULL OR m.expires_at = '' OR m.expires_at > datetime('now'))")
+	}
+	args = append(args, limit)
+	sqlText := `
+		SELECT m.id, m.stream_id, m.turn_id, m.run_id, m.workspace, m.kind, m.content,
+		       m.summary_level, m.source_event_seq, m.importance, m.token_estimate, m.expires_at, m.created_at
 		FROM memory_entries_fts f
 		JOIN memory_entries m ON m.id = f.rowid
-		WHERE memory_entries_fts MATCH ?
+		WHERE ` + strings.Join(where, " AND ") + `
 		ORDER BY rank
-		LIMIT ?
-	`, query, limit)
+		LIMIT ?`
+	rows, err := s.db.QueryContext(ctx, sqlText, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -414,13 +466,46 @@ func (s *SQLiteStore) SearchMemory(ctx context.Context, query string, limit int)
 	for rows.Next() {
 		var entry MemoryEntry
 		var createdAt string
-		if err := rows.Scan(&entry.ID, &entry.StreamID, &entry.TurnID, &entry.RunID, &entry.Kind, &entry.Content, &createdAt); err != nil {
+		var expiresAt sql.NullString
+		if err := rows.Scan(&entry.ID, &entry.StreamID, &entry.TurnID, &entry.RunID, &entry.Workspace, &entry.Kind, &entry.Content, &entry.SummaryLevel, &entry.SourceEventSeq, &entry.Importance, &entry.TokenEstimate, &expiresAt, &createdAt); err != nil {
 			return nil, err
+		}
+		if expiresAt.Valid {
+			entry.ExpiresAt = parseSQLiteTime(expiresAt.String)
 		}
 		entry.CreatedAt = parseSQLiteTime(createdAt)
 		entries = append(entries, entry)
 	}
 	return entries, rows.Err()
+}
+
+func compactStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func estimateMemoryTokens(content string) int {
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return 0
+	}
+	return (len(content) + 3) / 4
+}
+
+func sqliteTimeOrNil(value time.Time) any {
+	if value.IsZero() {
+		return nil
+	}
+	return value.UTC().Format(time.RFC3339Nano)
 }
 
 func (s *SQLiteStore) ForkStream(ctx context.Context, parentStreamID string, forkFromSeq int64, newQuery string) (string, error) {
